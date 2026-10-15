@@ -103,17 +103,17 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 // ============================================================================
-// 1. WEATHER & CANINE THRESHOLD ENGINE
+// 1. WEATHER & CANINE IMPERIAL THRESHOLD ENGINE
 // ============================================================================
 
 enum class SafetyLevel { GO, CAUTION, UNSAFE }
 
 data class DogWeatherReport(
-    val airTempC: Double,
-    val feelsLikeC: Double,
-    val pavementTempC: Double,
-    val rainMm: Double,
-    val windGustKmh: Double,
+    val airTempF: Double,
+    val feelsLikeF: Double,
+    val pavementTempF: Double,
+    val rainInch: Double,
+    val windGustMph: Double,
     val usAqi: Int,
     val status: SafetyLevel,
     val reason: String
@@ -126,7 +126,7 @@ object WeatherRepository {
                 val weatherUrl = "https://api.open-meteo.com/v1/forecast" +
                     "?latitude=$lat&longitude=$lon" +
                     "&current=temperature_2m,apparent_temperature,precipitation,wind_gusts_10m,shortwave_radiation" +
-                    "&wind_speed_unit=kmh&temperature_unit=celsius&precipitation_unit=mm"
+                    "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
 
                 val aqiUrl = "https://air-quality-api.open-meteo.com/v1/air-quality" +
                     "?latitude=$lat&longitude=$lon&current=us_aqi"
@@ -134,14 +134,15 @@ object WeatherRepository {
                 val weatherJson = JSONObject(getUrlText(weatherUrl)).getJSONObject("current")
                 val aqiJson = JSONObject(getUrlText(aqiUrl)).getJSONObject("current")
 
-                val airTemp = weatherJson.optDouble("temperature_2m", 15.0)
+                val airTemp = weatherJson.optDouble("temperature_2m", 60.0)
                 val feelsLike = weatherJson.optDouble("apparent_temperature", airTemp)
                 val rain = weatherJson.optDouble("precipitation", 0.0)
                 val gusts = weatherJson.optDouble("wind_gusts_10m", 0.0)
-                val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0)
+                val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0) // W/m^2
                 val aqi = aqiJson.optInt("us_aqi", 25)
 
-                val estPavement = ((airTemp + (0.025 * solarRad)) * 10.0).roundToInt() / 10.0
+                // Approximate sunlit pavement temp in Fahrenheit: T_air + (0.08 * solarRad)
+                val estPavement = ((airTemp + (0.08 * (solarRad / 3.17))) * 10.0).roundToInt() / 10.0
 
                 val (status, reason) = evaluateThresholds(
                     airTemp = airTemp,
@@ -154,11 +155,11 @@ object WeatherRepository {
 
                 Result.success(
                     DogWeatherReport(
-                        airTempC = airTemp,
-                        feelsLikeC = feelsLike,
-                        pavementTempC = estPavement,
-                        rainMm = rain,
-                        windGustKmh = gusts,
+                        airTempF = airTemp,
+                        feelsLikeF = feelsLike,
+                        pavementTempF = estPavement,
+                        rainInch = rain,
+                        windGustMph = gusts,
                         usAqi = aqi,
                         status = status,
                         reason = reason
@@ -180,19 +181,18 @@ object WeatherRepository {
         val unsafeReasons = mutableListOf<String>()
         val cautionReasons = mutableListOf<String>()
 
-        if (pavement >= 48.0) unsafeReasons.add("Pavement burn risk (${pavement}°C)")
-        else if (pavement >= 40.0) cautionReasons.add("Warm pavement (${pavement}°C - stick to shade/grass)")
+        if (pavement >= 118.0) unsafeReasons.add("Pavement burn risk (${pavement}°F)")
+        else if (pavement >= 104.0) cautionReasons.add("Warm pavement (${pavement}°F - stick to shade/grass)")
 
-        if (feelsLike < 0.0) unsafeReasons.add("Freezing wind chill (${feelsLike}°C)")
-        else if (airTemp >= 27.0) unsafeReasons.add("Heat exhaustion risk (${airTemp}°C)")
-        else if (feelsLike < 10.0) cautionReasons.add("Chilly (${feelsLike}°C - coat recommended)")
-        else if (airTemp >= 22.0) cautionReasons.add("Warm air (${airTemp}°C)")
+        if (feelsLike < 32.0) unsafeReasons.add("Freezing wind chill (${feelsLike}°F)")
+        else if (airTemp >= 80.0) unsafeReasons.add("Heat exhaustion risk (${airTemp}°F)")
+        else if (feelsLike < 50.0) cautionReasons.add("Chilly (${feelsLike}°F - coat recommended)")
+        else if (airTemp >= 72.0) cautionReasons.add("Warm air (${airTemp}°F)")
 
-        if (rain > 2.5) unsafeReasons.add("Heavy rain (${rain} mm/h)")
-        else if (rain > 0.0) cautionReasons.add("Light rain (${rain} mm/h - wet coat heat loss)")
+        if (rain > 0.1) unsafeReasons.add("Rain (${rain} in/h)")
 
-        if (gusts >= 40.0) unsafeReasons.add("High wind gusts (${gusts} km/h)")
-        else if (gusts >= 25.0) cautionReasons.add("Breezy gusts (${gusts} km/h)")
+        if (gusts >= 25.0) unsafeReasons.add("High wind gusts (${gusts} mph)")
+        else if (gusts >= 15.0) cautionReasons.add("Breezy gusts (${gusts} mph)")
 
         if (aqi > 100) unsafeReasons.add("Poor air quality (AQI $aqi)")
         else if (aqi > 50) cautionReasons.add("Moderate AQI ($aqi)")
@@ -223,8 +223,8 @@ data class WalkRecord(
     val timestampMillis: Long,
     val distanceMeters: Double,
     val durationSeconds: Long,
-    val airTempC: Double,
-    val pavementTempC: Double,
+    val airTempF: Double,
+    val pavementTempF: Double,
     val safetyStatus: String,
     val routeSerialized: String
 ) {
@@ -249,19 +249,21 @@ data class WalkRecord(
         return String.format(Locale.US, "%02d:%02d", mins, secs)
     }
 
-    fun formattedDistanceKm(): String =
-        String.format(Locale.US, "%.2f km", distanceMeters / 1000.0)
+    fun formattedDistanceMiles(): String {
+        val miles = distanceMeters / 1609.34
+        return String.format(Locale.US, "%.2f mi", miles)
+    }
 
     fun formattedPace(): String {
-        val distKm = distanceMeters / 1000.0
-        return if (distKm >= 0.05) {
-            val pace = (durationSeconds / 60.0) / distKm
-            String.format(Locale.US, "%.1f min/km", pace)
-        } else "-- min/km"
+        val miles = distanceMeters / 1609.34
+        return if (miles >= 0.03) {
+            val pace = (durationSeconds / 60.0) / miles
+            String.format(Locale.US, "%.1f min/mi", pace)
+        } else "-- min/mi"
     }
 
     fun toMarkdownRow(): String {
-        return "| ${formattedDate()} | ${formattedDistanceKm()} | ${formattedDuration()} | ${formattedPace()} | ${airTempC}°C / ${pavementTempC}°C | $safetyStatus |"
+        return "| ${formattedDate()} | ${formattedDistanceMiles()} | ${formattedDuration()} | ${formattedPace()} | ${airTempF}°F / ${pavementTempF}°F | $safetyStatus |"
     }
 
     companion object {
@@ -305,7 +307,7 @@ abstract class WalkDatabase : RoomDatabase() {
 }
 
 // ============================================================================
-// 3. FOREGROUND GPS LOCATION SERVICE (SCREEN-OFF TRACKING)
+// 3. FOREGROUND GPS LOCATION SERVICE
 // ============================================================================
 
 data class WalkSessionState(
@@ -369,7 +371,6 @@ object WalkStateHolder {
 }
 
 class WalkTrackerService : Service() {
-
     private lateinit var fusedClient: FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -472,12 +473,16 @@ class WalkTrackerService : Service() {
 }
 
 // ============================================================================
-// 4. MAIN ACTIVITY & JETPACK COMPOSE UI
+// 4. MAIN ACTIVITY & UI (IMPERIAL + OSM USER AGENT)
 // ============================================================================
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Load OSM configuration and set unique user agent to prevent policy block
+        val prefs = getSharedPreferences("osmdroid", Context.MODE_PRIVATE)
+        Configuration.getInstance().load(applicationContext, prefs)
         Configuration.getInstance().userAgentValue = packageName
 
         setContent {
@@ -596,7 +601,7 @@ fun DogWalkScreen() {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Viewing route: ${pastWalk.formattedDate()} (${pastWalk.formattedDistanceKm()})",
+                        text = "Viewing route: ${pastWalk.formattedDate()} (${pastWalk.formattedDistanceMiles()})",
                         color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold
@@ -635,8 +640,8 @@ fun DogWalkScreen() {
                                 timestampMillis = System.currentTimeMillis(),
                                 distanceMeters = snapshotDist,
                                 durationSeconds = snapshotSecs,
-                                airTempC = weatherReport?.airTempC ?: 0.0,
-                                pavementTempC = weatherReport?.pavementTempC ?: 0.0,
+                                airTempF = weatherReport?.airTempF ?: 0.0,
+                                pavementTempF = weatherReport?.pavementTempF ?: 0.0,
                                 safetyStatus = weatherReport?.status?.name ?: "N/A",
                                 routeSerialized = WalkRecord.serializeRoute(snapshotPoints)
                             )
@@ -683,7 +688,7 @@ fun WalkHistoryList(
     onDeleteWalk: (WalkRecord) -> Unit
 ) {
     val context = LocalContext.current
-    val totalKm = walks.sumOf { it.distanceMeters } / 1000.0
+    val totalMiles = walks.sumOf { it.distanceMeters } / 1609.34
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -699,7 +704,7 @@ fun WalkHistoryList(
         ) {
             Column {
                 Text(
-                    text = "Total Logged: ${String.format(Locale.US, "%.2f km", totalKm)}",
+                    text = "Total Logged: ${String.format(Locale.US, "%.2f mi", totalMiles)}",
                     color = Color.White,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
@@ -769,14 +774,14 @@ fun WalkHistoryList(
                             }
 
                             Text(
-                                text = "${walk.formattedDistanceKm()}  •  ${walk.formattedDuration()}  •  ${walk.formattedPace()}",
+                                text = "${walk.formattedDistanceMiles()}  •  ${walk.formattedDuration()}  •  ${walk.formattedPace()}",
                                 color = Color(0xFF00E676),
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
 
                             Text(
-                                text = "Air: ${walk.airTempC}°C  |  Est. Pavement: ${walk.pavementTempC}°C",
+                                text = "Air: ${walk.airTempF}°F  |  Est. Pavement: ${walk.pavementTempF}°F",
                                 color = Color.LightGray,
                                 fontSize = 12.sp
                             )
@@ -864,9 +869,9 @@ fun WeatherBanner(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                MetricPill("Air / Chill", "${report.airTempC}°C / ${report.feelsLikeC}°C", Modifier.weight(1f))
-                MetricPill("Pavement", "${report.pavementTempC}°C", Modifier.weight(1f))
-                MetricPill("Rain / Wind", "${report.rainMm}mm / ${report.windGustKmh.toInt()}km/h", Modifier.weight(1f))
+                MetricPill("Air / Chill", "${report.airTempF}°F / ${report.feelsLikeF}°F", Modifier.weight(1f))
+                MetricPill("Pavement", "${report.pavementTempF}°F", Modifier.weight(1f))
+                MetricPill("Rain / Wind", "${report.rainInch}in / ${report.windGustMph.toInt()}mph", Modifier.weight(1f))
                 MetricPill("US AQI", "${report.usAqi}", Modifier.weight(0.7f))
             }
         }
@@ -942,15 +947,15 @@ fun WalkControlPanel(
     walkState: WalkSessionState,
     onToggleWalk: () -> Unit
 ) {
-    val distKm = walkState.distanceMeters / 1000.0
+    val distMiles = walkState.distanceMeters / 1609.34
     val mins = walkState.elapsedSeconds / 60
     val secs = walkState.elapsedSeconds % 60
     val durationFormatted = String.format(Locale.US, "%02d:%02d", mins, secs)
 
-    val paceStr = if (distKm >= 0.05) {
-        val paceMinPerKm = (walkState.elapsedSeconds / 60.0) / distKm
-        String.format(Locale.US, "%.1f min/km", paceMinPerKm)
-    } else "-- min/km"
+    val paceStr = if (distMiles >= 0.03) {
+        val paceMinPerMile = (walkState.elapsedSeconds / 60.0) / distMiles
+        String.format(Locale.US, "%.1f min/mi", paceMinPerMile)
+    } else "-- min/mi"
 
     Column(
         modifier = Modifier
@@ -963,7 +968,7 @@ fun WalkControlPanel(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            StatBlock("Distance", String.format(Locale.US, "%.2f km", distKm))
+            StatBlock("Distance", String.format(Locale.US, "%.2f mi", distMiles))
             StatBlock("Duration", durationFormatted)
             StatBlock("Pace", paceStr)
         }
