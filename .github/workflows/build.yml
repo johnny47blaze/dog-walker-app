@@ -172,4 +172,3 @@ jobs:
         with:
           name: DogWalkTracker-APK
           path: app/build/outputs/apk/debug/app-debug.apk
-          
