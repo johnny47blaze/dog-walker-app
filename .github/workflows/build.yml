@@ -7,9 +7,10 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04 # Pinned to maintain a stable build environment
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout Code
+        uses: actions/checkout@v5
 
       - name: Auto-Fix Folders, Icons, and Configs
         run: |
@@ -171,4 +172,3 @@ jobs:
         with:
           name: DogWalkTracker-APK
           path: app/build/outputs/apk/debug/app-debug.apk
-          
