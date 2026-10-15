@@ -139,7 +139,7 @@ object WeatherRepository {
                 val feelsLike = weatherJson.optDouble("apparent_temperature", airTemp)
                 val rain = weatherJson.optDouble("precipitation", 0.0)
                 val gusts = weatherJson.optDouble("wind_gusts_10m", 0.0)
-                val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0) // W/m^2
+                val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0)
                 val aqi = aqiJson.optInt("us_aqi", 25)
 
                 // Sunlit dark asphalt estimate in Fahrenheit: T_air_F + (0.045 * solarRad)
@@ -265,7 +265,7 @@ data class WalkRecord(
     }
 
     fun toMarkdownRow(): String {
-        return "| ${formattedDate()} | ${formattedDistanceMiles()} | ${formattedDuration()} | ${formattedPace()} | ${airTempF}°F / ${pavementTempF}°F | $safetyStatus |"
+        return "| ${formattedDate()} | ${formattedDistanceMiles()} \vert{}${formattedDuration()} | ${formattedPace()} \vert{}${airTempF}°F / ${pavementTempF}°F \vert{}$safetyStatus |"
     }
 
     companion object {
@@ -477,8 +477,21 @@ class WalkTrackerService : Service() {
 }
 
 // ============================================================================
-// 4. TILE SOURCES & MAIN UI
+// 4. TILE SOURCES (DARK, LIGHT, OSM) & MAIN UI
 // ============================================================================
+
+val CARTO_DARK_SOURCE = XYTileSource(
+    "CartoDark_v2",
+    0,
+    19,
+    256,
+    ".png",
+    arrayOf(
+        "https://a.basemaps.cartocdn.com/dark_all/",
+        "https://b.basemaps.cartocdn.com/dark_all/",
+        "https://c.basemaps.cartocdn.com/dark_all/"
+    )
+)
 
 val CARTO_VOYAGER_SOURCE = XYTileSource(
     "CartoVoyager_v2",
@@ -502,6 +515,17 @@ val OSM_DIRECT_SOURCE = XYTileSource(
     arrayOf("https://tile.openstreetmap.org/")
 )
 
+enum class MapStyle(val label: String, val source: XYTileSource) {
+    DARK("Dark", CARTO_DARK_SOURCE),
+    LIGHT("Light", CARTO_VOYAGER_SOURCE),
+    OSM("OSM", OSM_DIRECT_SOURCE);
+
+    fun next(): MapStyle {
+        val values = entries
+        return values[(ordinal + 1) % values.size]
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -510,13 +534,11 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("osmdroid_clean_prefs", Context.MODE_PRIVATE)
         osmConfig.load(applicationContext, prefs)
 
-        // Do NOT use packageName ("com.example.dogwalk") - OSM blocks "com.example.*"
         val customUa = "PersonalDogWalkTracker/2.0 (Android; PersonalUse)"
         osmConfig.userAgentValue = customUa
         osmConfig.additionalHttpRequestProperties["User-Agent"] = customUa
         osmConfig.additionalHttpRequestProperties["Referer"] = "https://www.openstreetmap.org/"
 
-        // Use a dedicated fresh cache directory so old "Access Blocked" tiles are never loaded
         val cleanCacheDir = File(cacheDir, "osm_tiles_v2")
         cleanCacheDir.mkdirs()
         osmConfig.osmdroidTileCache = cleanCacheDir
@@ -541,9 +563,14 @@ fun DogWalkScreen() {
     val walkDao = remember { WalkDatabase.getInstance(context).walkDao() }
     val savedWalks by walkDao.getAllWalks().collectAsState(initial = emptyList())
 
+    val prefs = remember { context.getSharedPreferences("osmdroid_clean_prefs", Context.MODE_PRIVATE) }
+    var mapStyle by remember {
+        val savedName = prefs.getString("saved_map_style", MapStyle.DARK.name) ?: MapStyle.DARK.name
+        mutableStateOf(runCatching { MapStyle.valueOf(savedName) }.getOrDefault(MapStyle.DARK))
+    }
+
     var activeTab by remember { mutableIntStateOf(0) }
     var previewWalk by remember { mutableStateOf<WalkRecord?>(null) }
-    var useCartoTiles by remember { mutableStateOf(true) }
 
     var weatherReport by remember { mutableStateOf<DogWeatherReport?>(null) }
     var weatherError by remember { mutableStateOf<String?>(null) }
@@ -661,18 +688,22 @@ fun DogWalkScreen() {
                     currentLocation = walkState.currentLocation,
                     routePoints = displayedRoute,
                     isHistoricalRoute = isHistoricalRoute,
-                    useCartoTiles = useCartoTiles
+                    mapStyle = mapStyle
                 )
 
                 Button(
-                    onClick = { useCartoTiles = !useCartoTiles },
+                    onClick = {
+                        val nextStyle = mapStyle.next()
+                        mapStyle = nextStyle
+                        prefs.edit().putString("saved_map_style", nextStyle.name).apply()
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1E1E1E)),
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(8.dp)
                 ) {
                     Text(
-                        text = if (useCartoTiles) "Map: Carto" else "Map: OSM",
+                        text = "Map: ${mapStyle.label}",
                         color = Color.White,
                         fontSize = 11.sp
                     )
@@ -826,14 +857,14 @@ fun WalkHistoryList(
                             }
 
                             Text(
-                                text = "${walk.formattedDistanceMiles()}  •  ${walk.formattedDuration()}  •  ${walk.formattedPace()}",
+                                text = "${walk.formattedDistanceMiles()}  •  ${walk.formattedDuration()}  •${walk.formattedPace()}",
                                 color = Color(0xFF00E676),
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
 
                             Text(
-                                text = "Air: ${walk.airTempF}°F  |  Est. Pavement: ${walk.pavementTempF}°F",
+                                text = "Air: ${walk.airTempF}°F  \vert{}  Est. Pavement: ${walk.pavementTempF}°F",
                                 color = Color.LightGray,
                                 fontSize = 12.sp
                             )
@@ -948,9 +979,9 @@ fun OsmMapContainer(
     currentLocation: GeoPoint?,
     routePoints: List<GeoPoint>,
     isHistoricalRoute: Boolean,
-    useCartoTiles: Boolean
+    mapStyle: MapStyle
 ) {
-    val activeTileSource = if (useCartoTiles) CARTO_VOYAGER_SOURCE else OSM_DIRECT_SOURCE
+    val activeTileSource = mapStyle.source
 
     AndroidView(
         modifier = Modifier.fillMaxSize(),
@@ -958,6 +989,9 @@ fun OsmMapContainer(
             MapView(ctx).apply {
                 setTileSource(activeTileSource)
                 setMultiTouchControls(true)
+                // Dark background grid prevents white flashes when loading tiles at night
+                overlayManager.tilesOverlay.loadingBackgroundColor = android.graphics.Color.parseColor("#121212")
+                overlayManager.tilesOverlay.loadingLineColor = android.graphics.Color.parseColor("#262626")
                 controller.setZoom(17.5)
                 controller.setCenter(currentLocation ?: GeoPoint(42.375, -122.916))
             }
@@ -1028,30 +1062,4 @@ fun WalkControlPanel(
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             StatBlock("Distance", String.format(Locale.US, "%.2f mi", distMiles))
-            StatBlock("Duration", durationFormatted)
-            StatBlock("Pace", paceStr)
-        }
-
-        Button(
-            onClick = onToggleWalk,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (walkState.isTracking) Color(0xFFD32F2F) else Color(0xFF2E7D32)
-            ),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(
-                text = if (walkState.isTracking) "STOP & SAVE WALK" else "START WALK",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-@Composable
-fun StatBlock(label: String, value: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(text = label, color = Color.Gray, fontSize = 12.sp)
-        Text(text = value, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-    }
-}
+            StatBlock("Duration", duration
