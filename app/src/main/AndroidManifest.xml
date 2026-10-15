@@ -31,5 +31,4 @@
             android:foregroundServiceType="location" />
 
     </application>
-</mani
-  fest>
+</manifest>
