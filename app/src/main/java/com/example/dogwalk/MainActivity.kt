@@ -11,11 +11,15 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Outline
 import android.location.Location
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Looper
+import android.view.View
+import android.view.ViewOutlineProvider
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,6 +29,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -53,6 +58,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -90,11 +97,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapEventsReceiver
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import org.osmdroid.views.overlay.TilesOverlay
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -139,7 +151,7 @@ object WeatherRepository {
                 val feelsLike = weatherJson.optDouble("apparent_temperature", airTemp)
                 val rain = weatherJson.optDouble("precipitation", 0.0)
                 val gusts = weatherJson.optDouble("wind_gusts_10m", 0.0)
-                val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0) // W/m^2
+                val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0)
                 val aqi = aqiJson.optInt("us_aqi", 25)
 
                 // Sunlit dark asphalt estimate in Fahrenheit: T_air_F + (0.045 * solarRad)
@@ -211,12 +223,67 @@ object WeatherRepository {
         connection.connectTimeout = 8000
         connection.readTimeout = 8000
         connection.requestMethod = "GET"
+        connection.setRequestProperty("User-Agent", "PersonalDogWalkTracker/3.1 (Android)")
         return connection.inputStream.bufferedReader().use { it.readText() }
     }
 }
 
 // ============================================================================
-// 2. ROOM SQLITE DATABASE FOR WALK HISTORY (VERSION 2 - IMPERIAL)
+// 2. OSRM FOOT-ROUTING ENGINE (KEYLESS SIDEWALK & TRAIL SNAPPING)
+// ============================================================================
+
+data class PlannedLeg(
+    val anchor: GeoPoint,
+    val snappedPoints: List<GeoPoint>
+)
+
+object RouteSnapper {
+    suspend fun snapFootSegment(start: GeoPoint, end: GeoPoint): List<GeoPoint> =
+        withContext(Dispatchers.IO) {
+            val coords = "${start.longitude},${start.latitude};${end.longitude},${end.latitude}"
+            val endpoints = listOf(
+                "https://routing.openstreetmap.de/routed-foot/route/v1/foot/$coords?overview=full&geometries=geojson",
+                "https://router.project-osrm.org/route/v1/foot/$coords?overview=full&geometries=geojson"
+            )
+
+            for (url in endpoints) {
+                try {
+                    val conn = URL(url).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 6000
+                    conn.readTimeout = 6000
+                    conn.requestMethod = "GET"
+                    conn.setRequestProperty("User-Agent", "PersonalDogWalkTracker/3.1 (Android)")
+
+                    if (conn.responseCode == 200) {
+                        val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                        val json = JSONObject(responseText)
+                        val routes = json.optJSONArray("routes")
+                        if (routes != null && routes.length() > 0) {
+                            val geometry = routes.getJSONObject(0).getJSONObject("geometry")
+                            val coordArray = geometry.getJSONArray("coordinates")
+                            val points = ArrayList<GeoPoint>(coordArray.length())
+                            for (i in 0 until coordArray.length()) {
+                                val pair = coordArray.getJSONArray(i)
+                                val lon = pair.getDouble(0)
+                                val lat = pair.getDouble(1)
+                                points.add(GeoPoint(lat, lon))
+                            }
+                            if (points.isNotEmpty()) {
+                                return@withContext points
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Try next endpoint or fall back to straight line
+                }
+            }
+            // Offline / fallback straight segment
+            listOf(start, end)
+        }
+}
+
+// ============================================================================
+// 3. ROOM SQLITE DATABASE (VERSION 3 - WALKS + PLANNED ROUTES)
 // ============================================================================
 
 @Entity(tableName = "walk_records")
@@ -230,6 +297,9 @@ data class WalkRecord(
     val safetyStatus: String,
     val routeSerialized: String
 ) {
+    val isPlannedRoute: Boolean
+        get() = safetyStatus == "PLANNED"
+
     fun toGeoPoints(): List<GeoPoint> {
         if (routeSerialized.isBlank()) return emptyList()
         return routeSerialized.split(";").mapNotNull { pair ->
@@ -246,6 +316,7 @@ data class WalkRecord(
         SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(timestampMillis))
 
     fun formattedDuration(): String {
+        if (isPlannedRoute) return "Planned Route"
         val mins = durationSeconds / 60
         val secs = durationSeconds % 60
         return String.format(Locale.US, "%02d:%02d", mins, secs)
@@ -257,6 +328,7 @@ data class WalkRecord(
     }
 
     fun formattedPace(): String {
+        if (isPlannedRoute) return "${toGeoPoints().size} path pts"
         val miles = distanceMeters / 1609.34
         return if (miles >= 0.03) {
             val pace = (durationSeconds / 60.0) / miles
@@ -286,7 +358,7 @@ interface WalkDao {
     suspend fun deleteWalk(walk: WalkRecord)
 }
 
-@Database(entities = [WalkRecord::class], version = 2, exportSchema = false)
+@Database(entities = [WalkRecord::class], version = 3, exportSchema = false)
 abstract class WalkDatabase : RoomDatabase() {
     abstract fun walkDao(): WalkDao
 
@@ -311,8 +383,23 @@ abstract class WalkDatabase : RoomDatabase() {
 }
 
 // ============================================================================
-// 3. FOREGROUND GPS LOCATION SERVICE
+// 4. FOREGROUND GPS LOCATION SERVICE & DISTANCE HELPER
 // ============================================================================
+
+fun calculatePolylineMeters(points: List<GeoPoint>): Double {
+    if (points.size < 2) return 0.0
+    var total = 0.0
+    val results = FloatArray(1)
+    for (i in 0 until points.size - 1) {
+        Location.distanceBetween(
+            points[i].latitude, points[i].longitude,
+            points[i + 1].latitude, points[i + 1].longitude,
+            results
+        )
+        total += results[0]
+    }
+    return total
+}
 
 data class WalkSessionState(
     val isTracking: Boolean = false,
@@ -477,24 +564,11 @@ class WalkTrackerService : Service() {
 }
 
 // ============================================================================
-// 4. TILE SOURCES & MAIN UI
+// 5. KEYLESS TILE SOURCES, GHOST MODES & MAIN UI
 // ============================================================================
 
-val CARTO_VOYAGER_SOURCE = XYTileSource(
-    "CartoVoyager_v2",
-    0,
-    19,
-    256,
-    ".png",
-    arrayOf(
-        "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
-        "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
-        "https://c.basemaps.cartocdn.com/rastertiles/voyager/"
-    )
-)
-
-val OSM_DIRECT_SOURCE = XYTileSource(
-    "OSM_Direct_v2",
+val OSM_KEYLESS_SOURCE = XYTileSource(
+    "OSM_Keyless_v3",
     0,
     19,
     256,
@@ -502,22 +576,57 @@ val OSM_DIRECT_SOURCE = XYTileSource(
     arrayOf("https://tile.openstreetmap.org/")
 )
 
+val ESRI_STREET_SOURCE = object : OnlineTileSourceBase(
+    "EsriWorldStreet_v3",
+    0,
+    19,
+    256,
+    "",
+    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/")
+) {
+    override fun getTileURLString(pMapTileIndex: Long): String {
+        return baseUrl + MapTileIndex.getZoom(pMapTileIndex) + "/" +
+            MapTileIndex.getY(pMapTileIndex) + "/" +
+            MapTileIndex.getX(pMapTileIndex)
+    }
+}
+
+enum class MapStyle(val label: String, val source: OnlineTileSourceBase, val invertForDark: Boolean) {
+    DARK("Dark", OSM_KEYLESS_SOURCE, true),
+    LIGHT("Light", OSM_KEYLESS_SOURCE, false),
+    ESRI("Esri", ESRI_STREET_SOURCE, false);
+
+    fun next(): MapStyle {
+        val values = entries
+        return values[(ordinal + 1) % values.size]
+    }
+}
+
+enum class GhostMode(val label: String) {
+    OFF("Ghost: OFF"),
+    PINNED("Ghost: PINNED"),
+    ALL("Ghost: ALL");
+
+    fun next(): GhostMode {
+        val values = entries
+        return values[(ordinal + 1) % values.size]
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val osmConfig = Configuration.getInstance()
-        val prefs = getSharedPreferences("osmdroid_clean_prefs", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("osmdroid_clean_prefs_v3", Context.MODE_PRIVATE)
         osmConfig.load(applicationContext, prefs)
 
-        // Do NOT use packageName ("com.example.dogwalk") - OSM blocks "com.example.*"
-        val customUa = "PersonalDogWalkTracker/2.0 (Android; PersonalUse)"
+        val customUa = "PersonalDogWalkTracker/3.1 (Android; PersonalUse)"
         osmConfig.userAgentValue = customUa
         osmConfig.additionalHttpRequestProperties["User-Agent"] = customUa
         osmConfig.additionalHttpRequestProperties["Referer"] = "https://www.openstreetmap.org/"
 
-        // Use a dedicated fresh cache directory so old "Access Blocked" tiles are never loaded
-        val cleanCacheDir = File(cacheDir, "osm_tiles_v2")
+        val cleanCacheDir = File(cacheDir, "osm_tiles_v3")
         cleanCacheDir.mkdirs()
         osmConfig.osmdroidTileCache = cleanCacheDir
 
@@ -541,9 +650,29 @@ fun DogWalkScreen() {
     val walkDao = remember { WalkDatabase.getInstance(context).walkDao() }
     val savedWalks by walkDao.getAllWalks().collectAsState(initial = emptyList())
 
+    val prefs = remember { context.getSharedPreferences("osmdroid_clean_prefs_v3", Context.MODE_PRIVATE) }
+    var mapStyle by remember {
+        val savedName = prefs.getString("saved_map_style", MapStyle.DARK.name) ?: MapStyle.DARK.name
+        mutableStateOf(runCatching { MapStyle.valueOf(savedName) }.getOrDefault(MapStyle.DARK))
+    }
+
+    var ghostMode by remember { mutableStateOf(GhostMode.PINNED) }
+    var pinnedGhostWalk by remember { mutableStateOf<WalkRecord?>(null) }
+
+    // Route Builder + Street Snapping state
+    var isPlanningRoute by remember { mutableStateOf(false) }
+    var snapToStreets by remember { mutableStateOf(true) }
+    var isSnappingSegment by remember { mutableStateOf(false) }
+    var plannedLegs by remember { mutableStateOf<List<PlannedLeg>>(emptyList()) }
+
+    val plannedFullGeometry = remember(plannedLegs) {
+        plannedLegs.flatMap { it.snappedPoints }
+    }
+    val plannedAnchorWaypoints = remember(plannedLegs) {
+        plannedLegs.map { it.anchor }
+    }
+
     var activeTab by remember { mutableIntStateOf(0) }
-    var previewWalk by remember { mutableStateOf<WalkRecord?>(null) }
-    var useCartoTiles by remember { mutableStateOf(true) }
 
     var weatherReport by remember { mutableStateOf<DogWeatherReport?>(null) }
     var weatherError by remember { mutableStateOf<String?>(null) }
@@ -587,12 +716,47 @@ fun DogWalkScreen() {
         permissionLauncher.launch(perms.toTypedArray())
     }
 
+    val activeGhostRecord = pinnedGhostWalk ?: savedWalks.firstOrNull()
+    val ghostTrailsToRender: List<List<GeoPoint>> = remember(ghostMode, activeGhostRecord, savedWalks) {
+        when (ghostMode) {
+            GhostMode.OFF -> emptyList()
+            GhostMode.PINNED -> listOfNotNull(activeGhostRecord?.toGeoPoints()?.takeIf { it.size > 1 })
+            GhostMode.ALL -> savedWalks.map { it.toGeoPoints() }.filter { it.size > 1 }
+        }
+    }
+
+    val ghostPacerPoint: GeoPoint? = remember(
+        walkState.isTracking,
+        walkState.elapsedSeconds,
+        ghostMode,
+        activeGhostRecord
+    ) {
+        if (!walkState.isTracking || ghostMode == GhostMode.OFF || activeGhostRecord == null) {
+            null
+        } else {
+            val pts = activeGhostRecord.toGeoPoints()
+            if (pts.size < 2) null
+            else {
+                val targetDuration = if (activeGhostRecord.durationSeconds > 0) {
+                    activeGhostRecord.durationSeconds
+                } else {
+                    val miles = activeGhostRecord.distanceMeters / 1609.34
+                    (miles * 20.0 * 60.0).toLong().coerceAtLeast(60L)
+                }
+                val fraction = (walkState.elapsedSeconds.toDouble() / targetDuration.toDouble()).coerceIn(0.0, 1.0)
+                val index = ((pts.size - 1) * fraction).roundToInt().coerceIn(0, pts.size - 1)
+                pts[index]
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
+        // TOP TAB BAR
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -607,7 +771,7 @@ fun DogWalkScreen() {
                 ),
                 modifier = Modifier.weight(1f)
             ) {
-                Text("LIVE TRACKER", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("LIVE MAP", color = Color.White, fontWeight = FontWeight.Bold)
             }
             Button(
                 onClick = { activeTab = 1 },
@@ -616,11 +780,12 @@ fun DogWalkScreen() {
                 ),
                 modifier = Modifier.weight(1f)
             ) {
-                Text("HISTORY (${savedWalks.size})", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("ROUTES & LOGS (${savedWalks.size})", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
 
         if (activeTab == 0) {
+            // 1. WEATHER BANNER
             WeatherBanner(
                 report = weatherReport,
                 isLoading = isLoadingWeather,
@@ -628,59 +793,211 @@ fun DogWalkScreen() {
                 onRefresh = { refreshLocationAndWeather() }
             )
 
-            previewWalk?.let { pastWalk ->
+            // 2. ROUTE BUILDER TOOLBAR (With OSRM Street Snapping)
+            if (isPlanningRoute) {
+                val plannedMeters = calculatePolylineMeters(plannedFullGeometry)
+                val plannedMiles = plannedMeters / 1609.34
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color(0xFF0277BD), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                        .background(Color(0xFF3E2723), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Viewing route: ${pastWalk.formattedDate()} (${pastWalk.formattedDistanceMiles()})",
-                        color = Color.White,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    TextButton(onClick = { previewWalk = null }) {
-                        Text("Clear", color = Color.White, fontWeight = FontWeight.Bold)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (isSnappingSegment) {
+                                "Snapping to trail..."
+                            } else {
+                                String.format(Locale.US, "Plan: %.2f mi (%d stops)", plannedMiles, plannedLegs.size)
+                            },
+                            color = Color(0xFFFFD600),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        Text(
+                            text = if (snapToStreets) "OSRM Foot Routing: ON" else "Straight Line Mode",
+                            color = Color.LightGray,
+                            fontSize = 11.sp
+                        )
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        OutlinedButton(
+                            onClick = { snapToStreets = !snapToStreets },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = if (snapToStreets) "Snap: ON" else "Snap: OFF",
+                                fontSize = 10.sp,
+                                color = if (snapToStreets) Color(0xFF00E676) else Color.LightGray
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                if (plannedLegs.isNotEmpty() && !isSnappingSegment) {
+                                    plannedLegs = plannedLegs.dropLast(1)
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                            Text("Undo", fontSize = 10.sp, color = Color.White)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                if (!isSnappingSegment) plannedLegs = emptyList()
+                            },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                            Text("Clear", fontSize = 10.sp, color = Color.White)
+                        }
+                        Button(
+                            onClick = {
+                                if (plannedFullGeometry.size >= 2 && !isSnappingSegment) {
+                                    scope.launch {
+                                        val newRoute = WalkRecord(
+                                            timestampMillis = System.currentTimeMillis(),
+                                            distanceMeters = plannedMeters,
+                                            durationSeconds = 0L,
+                                            airTempF = weatherReport?.airTempF ?: 0.0,
+                                            pavementTempF = weatherReport?.pavementTempF ?: 0.0,
+                                            safetyStatus = "PLANNED",
+                                            routeSerialized = WalkRecord.serializeRoute(plannedFullGeometry)
+                                        )
+                                        walkDao.insertWalk(newRoute)
+                                        pinnedGhostWalk = newRoute
+                                        ghostMode = GhostMode.PINNED
+                                        plannedLegs = emptyList()
+                                        isPlanningRoute = false
+                                        Toast.makeText(context, "Snapped route saved as Ghost Trail!", Toast.LENGTH_SHORT).show()
+                                    }
+                                } else {
+                                    Toast.makeText(context, "Tap at least 2 points on the map", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF8F00)),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Save", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }
 
-            val displayedRoute = previewWalk?.toGeoPoints() ?: walkState.routePoints
-            val isHistoricalRoute = previewWalk != null
-
+            // 3. CLIPPED MAP VIEW CONTAINER
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clipToBounds()
             ) {
                 OsmMapContainer(
                     currentLocation = walkState.currentLocation,
-                    routePoints = displayedRoute,
-                    isHistoricalRoute = isHistoricalRoute,
-                    useCartoTiles = useCartoTiles
+                    liveRoutePoints = walkState.routePoints,
+                    ghostTrails = ghostTrailsToRender,
+                    ghostPacerPoint = ghostPacerPoint,
+                    plannedGeometry = plannedFullGeometry,
+                    plannedAnchors = plannedAnchorWaypoints,
+                    isPlanningRoute = isPlanningRoute,
+                    mapStyle = mapStyle,
+                    onMapTap = { tappedGeoPoint ->
+                        if (isPlanningRoute && !isSnappingSegment) {
+                            if (plannedLegs.isEmpty()) {
+                                plannedLegs = listOf(
+                                    PlannedLeg(
+                                        anchor = tappedGeoPoint,
+                                        snappedPoints = listOf(tappedGeoPoint)
+                                    )
+                                )
+                            } else {
+                                val prevAnchor = plannedLegs.last().anchor
+                                if (!snapToStreets) {
+                                    plannedLegs = plannedLegs + PlannedLeg(
+                                        anchor = tappedGeoPoint,
+                                        snappedPoints = listOf(tappedGeoPoint)
+                                    )
+                                } else {
+                                    isSnappingSegment = true
+                                    scope.launch {
+                                        val segmentPoints = RouteSnapper.snapFootSegment(prevAnchor, tappedGeoPoint)
+                                        // Drop the first point if it duplicates prevAnchor
+                                        val cleanedSegment = if (segmentPoints.size > 1) {
+                                            segmentPoints.drop(1)
+                                        } else {
+                                            segmentPoints
+                                        }
+                                        plannedLegs = plannedLegs + PlannedLeg(
+                                            anchor = tappedGeoPoint,
+                                            snappedPoints = cleanedSegment
+                                        )
+                                        isSnappingSegment = false
+                                    }
+                                }
+                            }
+                        }
+                    }
                 )
 
-                Button(
-                    onClick = { useCartoTiles = !useCartoTiles },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1E1E1E)),
+                // TOP MAP OVERLAY CONTROLS
+                Row(
                     modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(8.dp)
+                        .fillMaxWidth()
+                        .align(Alignment.TopCenter)
+                        .padding(8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = if (useCartoTiles) "Map: Carto" else "Map: OSM",
-                        color = Color.White,
-                        fontSize = 11.sp
-                    )
+                    Button(
+                        onClick = { ghostMode = ghostMode.next() },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (ghostMode != GhostMode.OFF) Color(0xCC006064) else Color(0xCC1E1E1E)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text(text = ghostMode.label, color = Color.White, fontSize = 11.sp)
+                    }
+
+                    Button(
+                        onClick = { isPlanningRoute = !isPlanningRoute },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isPlanningRoute) Color(0xFFFF8F00) else Color(0xCC1E1E1E)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = if (isPlanningRoute) "Planning: ON" else "Plan Route",
+                            color = if (isPlanningRoute) Color.Black else Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp
+                        )
+                    }
+
+                    Button(
+                        onClick = {
+                            val nextStyle = mapStyle.next()
+                            mapStyle = nextStyle
+                            prefs.edit().putString("saved_map_style", nextStyle.name).apply()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1E1E1E)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = "Map: ${mapStyle.label}",
+                            color = Color.White,
+                            fontSize = 11.sp
+                        )
+                    }
                 }
             }
 
+            // 4. WALK TELEMETRY & CONTROLS
             WalkControlPanel(
                 walkState = walkState,
+                ghostTargetMiles = if (ghostMode != GhostMode.OFF) {
+                    activeGhostRecord?.let { it.distanceMeters / 1609.34 }
+                } else null,
                 onToggleWalk = {
                     if (walkState.isTracking) {
                         val snapshotDist = walkState.distanceMeters
@@ -706,7 +1023,6 @@ fun DogWalkScreen() {
                         }
                         context.startService(stopIntent)
                     } else {
-                        previewWalk = null
                         val startIntent = Intent(context, WalkTrackerService::class.java).apply {
                             action = WalkTrackerService.ACTION_START
                         }
@@ -719,13 +1035,18 @@ fun DogWalkScreen() {
                 }
             )
         } else {
+            // WALK HISTORY & SAVED ROUTES SCREEN
             WalkHistoryList(
                 walks = savedWalks,
-                onViewRoute = { walk ->
-                    previewWalk = walk
+                pinnedGhostId = activeGhostRecord?.id,
+                onSetGhost = { walk ->
+                    pinnedGhostWalk = walk
+                    ghostMode = GhostMode.PINNED
                     activeTab = 0
+                    Toast.makeText(context, "Ghost Trail pinned to map", Toast.LENGTH_SHORT).show()
                 },
                 onDeleteWalk = { walk ->
+                    if (pinnedGhostWalk?.id == walk.id) pinnedGhostWalk = null
                     scope.launch { walkDao.deleteWalk(walk) }
                 }
             )
@@ -734,13 +1055,162 @@ fun DogWalkScreen() {
 }
 
 @Composable
+fun OsmMapContainer(
+    currentLocation: GeoPoint?,
+    liveRoutePoints: List<GeoPoint>,
+    ghostTrails: List<List<GeoPoint>>,
+    ghostPacerPoint: GeoPoint?,
+    plannedGeometry: List<GeoPoint>,
+    plannedAnchors: List<GeoPoint>,
+    isPlanningRoute: Boolean,
+    mapStyle: MapStyle,
+    onMapTap: (GeoPoint) -> Unit
+) {
+    val currentOnMapTap by androidx.compose.runtime.rememberUpdatedState(onMapTap)
+    val currentIsPlanning by androidx.compose.runtime.rememberUpdatedState(isPlanningRoute)
+
+    AndroidView(
+        modifier = Modifier
+            .fillMaxSize()
+            .clipToBounds(),
+        factory = { ctx ->
+            FrameLayout(ctx).apply {
+                clipChildren = true
+                clipToPadding = true
+                clipToOutline = true
+                outlineProvider = object : ViewOutlineProvider() {
+                    override fun getOutline(view: View, outline: Outline) {
+                        outline.setRect(0, 0, view.width, view.height)
+                    }
+                }
+
+                val mapView = MapView(ctx).apply {
+                    setTileSource(mapStyle.source)
+                    setMultiTouchControls(true)
+                    overlayManager.tilesOverlay.loadingBackgroundColor = android.graphics.Color.parseColor("#121212")
+                    overlayManager.tilesOverlay.loadingLineColor = android.graphics.Color.parseColor("#262626")
+                    controller.setZoom(17.0)
+                    controller.setCenter(currentLocation ?: GeoPoint(42.375, -122.916))
+                }
+                addView(
+                    mapView,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+        },
+        update = { container ->
+            val mapView = container.getChildAt(0) as MapView
+
+            if (mapView.tileProvider.tileSource.name() != mapStyle.source.name()) {
+                mapView.setTileSource(mapStyle.source)
+            }
+
+            mapView.overlayManager.tilesOverlay.setColorFilter(
+                if (mapStyle.invertForDark) TilesOverlay.INVERT_COLORS else null
+            )
+
+            mapView.overlays.clear()
+
+            // 1. Tap listener overlay for Route Planning
+            val tapReceiver = object : MapEventsReceiver {
+                override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
+                    if (currentIsPlanning && p != null) {
+                        currentOnMapTap(p)
+                        return true
+                    }
+                    return false
+                }
+
+                override fun longPressHelper(p: GeoPoint?): Boolean = false
+            }
+            mapView.overlays.add(MapEventsOverlay(tapReceiver))
+
+            // 2. Render Ghost Trails (semi-transparent cyan/purple under-layer)
+            ghostTrails.forEachIndexed { idx, ghostPoints ->
+                if (ghostPoints.size > 1) {
+                    val ghostLine = Polyline().apply {
+                        setPoints(ghostPoints)
+                        outlinePaint.color = if (idx == 0) {
+                            android.graphics.Color.parseColor("#9900E5FF")
+                        } else {
+                            android.graphics.Color.parseColor("#66B388FF")
+                        }
+                        outlinePaint.strokeWidth = 12f
+                    }
+                    mapView.overlays.add(ghostLine)
+                }
+            }
+
+            // 3. Render Ghost Pacer Marker
+            ghostPacerPoint?.let { ghostPt ->
+                val ghostMarker = Marker(mapView).apply {
+                    position = ghostPt
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    title = "Ghost Pacer"
+                    alpha = 0.8f
+                }
+                mapView.overlays.add(ghostMarker)
+            }
+
+            // 4. Render Street-Snapped Planned Route Line (Gold) & User Tap Anchors
+            if (plannedGeometry.size > 1) {
+                val planLine = Polyline().apply {
+                    setPoints(plannedGeometry)
+                    outlinePaint.color = android.graphics.Color.parseColor("#FFD600")
+                    outlinePaint.strokeWidth = 12f
+                }
+                mapView.overlays.add(planLine)
+            }
+            plannedAnchors.forEachIndexed { index, pt ->
+                val wpMarker = Marker(mapView).apply {
+                    position = pt
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    title = "Stop ${index + 1}"
+                }
+                mapView.overlays.add(wpMarker)
+            }
+
+            // 5. Render Active Live Walk Route (Bright Green)
+            if (liveRoutePoints.size > 1) {
+                val liveLine = Polyline().apply {
+                    setPoints(liveRoutePoints)
+                    outlinePaint.color = android.graphics.Color.parseColor("#00E676")
+                    outlinePaint.strokeWidth = 14f
+                }
+                mapView.overlays.add(liveLine)
+            }
+
+            // 6. Render Current GPS Location Marker
+            currentLocation?.let { loc ->
+                val marker = Marker(mapView).apply {
+                    position = loc
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    title = "Current Location"
+                }
+                mapView.overlays.add(marker)
+                if (!currentIsPlanning) {
+                    mapView.controller.animateTo(loc)
+                }
+            }
+
+            mapView.invalidate()
+        }
+    )
+}
+
+@Composable
 fun WalkHistoryList(
     walks: List<WalkRecord>,
-    onViewRoute: (WalkRecord) -> Unit,
+    pinnedGhostId: Long?,
+    onSetGhost: (WalkRecord) -> Unit,
     onDeleteWalk: (WalkRecord) -> Unit
 ) {
     val context = LocalContext.current
-    val totalMiles = walks.sumOf { it.distanceMeters } / 1609.34
+    val completedWalks = walks.filter { !it.isPlannedRoute }
+    val totalMiles = completedWalks.sumOf { it.distanceMeters } / 1609.34
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -756,13 +1226,13 @@ fun WalkHistoryList(
         ) {
             Column {
                 Text(
-                    text = "Total Logged: ${String.format(Locale.US, "%.2f mi", totalMiles)}",
+                    text = "Total Walked: ${String.format(Locale.US, "%.2f mi", totalMiles)}",
                     color = Color.White,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "${walks.size} recorded walks in SQLite",
+                    text = "${completedWalks.size} walks • ${walks.size - completedWalks.size} planned routes",
                     color = Color.Gray,
                     fontSize = 12.sp
                 )
@@ -784,7 +1254,7 @@ fun WalkHistoryList(
 
         if (walks.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No walks recorded yet. Start and stop a walk to save it.", color = Color.Gray)
+                Text("No walks or planned routes saved yet.", color = Color.Gray)
             }
         } else {
             LazyColumn(
@@ -792,8 +1262,11 @@ fun WalkHistoryList(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(walks, key = { it.id }) { walk ->
+                    val isPinned = walk.id == pinnedGhostId
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isPinned) Color(0xFF1A2E35) else Color(0xFF1E1E1E)
+                        ),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -813,11 +1286,12 @@ fun WalkHistoryList(
                                     fontSize = 15.sp
                                 )
                                 Text(
-                                    text = walk.safetyStatus,
+                                    text = if (walk.isPlannedRoute) "PLANNED ROUTE" else walk.safetyStatus,
                                     color = when (walk.safetyStatus) {
                                         "GO" -> Color(0xFF66BB6A)
                                         "CAUTION" -> Color(0xFFFFA726)
                                         "UNSAFE" -> Color(0xFFEF5350)
+                                        "PLANNED" -> Color(0xFFFFD600)
                                         else -> Color.LightGray
                                     },
                                     fontWeight = FontWeight.Bold,
@@ -832,21 +1306,30 @@ fun WalkHistoryList(
                                 fontWeight = FontWeight.SemiBold
                             )
 
-                            Text(
-                                text = "Air: ${walk.airTempF}°F  |  Est. Pavement: ${walk.pavementTempF}°F",
-                                color = Color.LightGray,
-                                fontSize = 12.sp
-                            )
+                            if (!walk.isPlannedRoute) {
+                                Text(
+                                    text = "Air: ${walk.airTempF}°F  |  Est. Pavement: ${walk.pavementTempF}°F",
+                                    color = Color.LightGray,
+                                    fontSize = 12.sp
+                                )
+                            }
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                OutlinedButton(
-                                    onClick = { onViewRoute(walk) },
-                                    modifier = Modifier.weight(1f)
+                                Button(
+                                    onClick = { onSetGhost(walk) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isPinned) Color(0xFF00838F) else Color(0xFF37474F)
+                                    ),
+                                    modifier = Modifier.weight(1.2f)
                                 ) {
-                                    Text("View Route", fontSize = 12.sp)
+                                    Text(
+                                        text = if (isPinned) "Active Ghost" else "Set Ghost",
+                                        fontSize = 12.sp,
+                                        color = Color.White
+                                    )
                                 }
                                 OutlinedButton(
                                     onClick = {
@@ -888,8 +1371,8 @@ fun WeatherBanner(
         modifier = Modifier
             .fillMaxWidth()
             .background(bgColor, RoundedCornerShape(12.dp))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -904,7 +1387,7 @@ fun WeatherBanner(
                     else -> "WAITING FOR GPS..."
                 },
                 color = Color.White,
-                fontSize = 18.sp,
+                fontSize = 17.sp,
                 fontWeight = FontWeight.Bold
             )
             TextButton(onClick = onRefresh) {
@@ -915,7 +1398,7 @@ fun WeatherBanner(
         if (error != null) {
             Text(text = error, color = Color.White, fontSize = 13.sp)
         } else if (report != null) {
-            Text(text = report.reason, color = Color.White, fontSize = 14.sp)
+            Text(text = report.reason, color = Color.White, fontSize = 13.sp)
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -944,66 +1427,9 @@ fun MetricPill(label: String, value: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun OsmMapContainer(
-    currentLocation: GeoPoint?,
-    routePoints: List<GeoPoint>,
-    isHistoricalRoute: Boolean,
-    useCartoTiles: Boolean
-) {
-    val activeTileSource = if (useCartoTiles) CARTO_VOYAGER_SOURCE else OSM_DIRECT_SOURCE
-
-    AndroidView(
-        modifier = Modifier.fillMaxSize(),
-        factory = { ctx ->
-            MapView(ctx).apply {
-                setTileSource(activeTileSource)
-                setMultiTouchControls(true)
-                controller.setZoom(17.5)
-                controller.setCenter(currentLocation ?: GeoPoint(42.375, -122.916))
-            }
-        },
-        update = { mapView ->
-            if (mapView.tileProvider.tileSource.name() != activeTileSource.name()) {
-                mapView.setTileSource(activeTileSource)
-            }
-
-            mapView.overlays.clear()
-
-            if (routePoints.size > 1) {
-                val line = Polyline().apply {
-                    setPoints(routePoints)
-                    outlinePaint.color = if (isHistoricalRoute) {
-                        android.graphics.Color.parseColor("#29B6F6")
-                    } else {
-                        android.graphics.Color.parseColor("#00E676")
-                    }
-                    outlinePaint.strokeWidth = 14f
-                }
-                mapView.overlays.add(line)
-            }
-
-            if (isHistoricalRoute && routePoints.isNotEmpty()) {
-                mapView.controller.animateTo(routePoints.first())
-            } else {
-                currentLocation?.let { loc ->
-                    val marker = Marker(mapView).apply {
-                        position = loc
-                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                        title = "Current Location"
-                    }
-                    mapView.overlays.add(marker)
-                    mapView.controller.animateTo(loc)
-                }
-            }
-
-            mapView.invalidate()
-        }
-    )
-}
-
-@Composable
 fun WalkControlPanel(
     walkState: WalkSessionState,
+    ghostTargetMiles: Double?,
     onToggleWalk: () -> Unit
 ) {
     val distMiles = walkState.distanceMeters / 1609.34
@@ -1016,6 +1442,12 @@ fun WalkControlPanel(
         String.format(Locale.US, "%.1f min/mi", paceMinPerMile)
     } else "-- min/mi"
 
+    val distLabel = if (ghostTargetMiles != null && ghostTargetMiles > 0.0) {
+        String.format(Locale.US, "%.2f / %.2f mi", distMiles, ghostTargetMiles)
+    } else {
+        String.format(Locale.US, "%.2f mi", distMiles)
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1027,7 +1459,7 @@ fun WalkControlPanel(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            StatBlock("Distance", String.format(Locale.US, "%.2f mi", distMiles))
+            StatBlock("Distance / Ghost", distLabel)
             StatBlock("Duration", durationFormatted)
             StatBlock("Pace", paceStr)
         }
@@ -1052,6 +1484,6 @@ fun WalkControlPanel(
 fun StatBlock(label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(text = label, color = Color.Gray, fontSize = 12.sp)
-        Text(text = value, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(text = value, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
     }
 }
