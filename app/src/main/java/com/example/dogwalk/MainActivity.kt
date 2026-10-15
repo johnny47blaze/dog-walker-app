@@ -90,11 +90,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.osmdroid.config.Configuration
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -141,8 +142,8 @@ object WeatherRepository {
                 val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0) // W/m^2
                 val aqi = aqiJson.optInt("us_aqi", 25)
 
-                // Approximate sunlit pavement temp in Fahrenheit: T_air + (0.08 * solarRad)
-                val estPavement = ((airTemp + (0.08 * (solarRad / 3.17))) * 10.0).roundToInt() / 10.0
+                // Sunlit dark asphalt estimate in Fahrenheit: T_air_F + (0.045 * solarRad)
+                val estPavement = ((airTemp + (0.045 * solarRad)) * 10.0).roundToInt() / 10.0
 
                 val (status, reason) = evaluateThresholds(
                     airTemp = airTemp,
@@ -189,7 +190,8 @@ object WeatherRepository {
         else if (feelsLike < 50.0) cautionReasons.add("Chilly (${feelsLike}°F - coat recommended)")
         else if (airTemp >= 72.0) cautionReasons.add("Warm air (${airTemp}°F)")
 
-        if (rain > 0.1) unsafeReasons.add("Rain (${rain} in/h)")
+        if (rain > 0.1) unsafeReasons.add("Heavy rain (${rain} in/h)")
+        else if (rain > 0.0) cautionReasons.add("Light rain (${rain} in/h - wet coat heat loss)")
 
         if (gusts >= 25.0) unsafeReasons.add("High wind gusts (${gusts} mph)")
         else if (gusts >= 15.0) cautionReasons.add("Breezy gusts (${gusts} mph)")
@@ -214,7 +216,7 @@ object WeatherRepository {
 }
 
 // ============================================================================
-// 2. ROOM SQLITE DATABASE FOR WALK HISTORY
+// 2. ROOM SQLITE DATABASE FOR WALK HISTORY (VERSION 2 - IMPERIAL)
 // ============================================================================
 
 @Entity(tableName = "walk_records")
@@ -284,7 +286,7 @@ interface WalkDao {
     suspend fun deleteWalk(walk: WalkRecord)
 }
 
-@Database(entities = [WalkRecord::class], version = 1, exportSchema = false)
+@Database(entities = [WalkRecord::class], version = 2, exportSchema = false)
 abstract class WalkDatabase : RoomDatabase() {
     abstract fun walkDao(): WalkDao
 
@@ -298,7 +300,9 @@ abstract class WalkDatabase : RoomDatabase() {
                     context.applicationContext,
                     WalkDatabase::class.java,
                     "dog_walk_history.db"
-                ).build()
+                )
+                    .fallbackToDestructiveMigration()
+                    .build()
                 INSTANCE = instance
                 instance
             }
@@ -473,17 +477,49 @@ class WalkTrackerService : Service() {
 }
 
 // ============================================================================
-// 4. MAIN ACTIVITY & UI (IMPERIAL + OSM USER AGENT)
+// 4. TILE SOURCES & MAIN UI
 // ============================================================================
+
+val CARTO_VOYAGER_SOURCE = XYTileSource(
+    "CartoVoyager_v2",
+    0,
+    19,
+    256,
+    ".png",
+    arrayOf(
+        "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://c.basemaps.cartocdn.com/rastertiles/voyager/"
+    )
+)
+
+val OSM_DIRECT_SOURCE = XYTileSource(
+    "OSM_Direct_v2",
+    0,
+    19,
+    256,
+    ".png",
+    arrayOf("https://tile.openstreetmap.org/")
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Load OSM configuration and set unique user agent to prevent policy block
-        val prefs = getSharedPreferences("osmdroid", Context.MODE_PRIVATE)
-        Configuration.getInstance().load(applicationContext, prefs)
-        Configuration.getInstance().userAgentValue = packageName
+        val osmConfig = Configuration.getInstance()
+        val prefs = getSharedPreferences("osmdroid_clean_prefs", Context.MODE_PRIVATE)
+        osmConfig.load(applicationContext, prefs)
+
+        // Do NOT use packageName ("com.example.dogwalk") - OSM blocks "com.example.*"
+        val customUa = "PersonalDogWalkTracker/2.0 (Android; PersonalUse)"
+        osmConfig.userAgentValue = customUa
+        osmConfig.additionalHttpRequestProperties["User-Agent"] = customUa
+        osmConfig.additionalHttpRequestProperties["Referer"] = "https://www.openstreetmap.org/"
+
+        // Use a dedicated fresh cache directory so old "Access Blocked" tiles are never loaded
+        val cleanCacheDir = File(cacheDir, "osm_tiles_v2")
+        cleanCacheDir.mkdirs()
+        osmConfig.osmdroidTileCache = cleanCacheDir
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -507,6 +543,7 @@ fun DogWalkScreen() {
 
     var activeTab by remember { mutableIntStateOf(0) }
     var previewWalk by remember { mutableStateOf<WalkRecord?>(null) }
+    var useCartoTiles by remember { mutableStateOf(true) }
 
     var weatherReport by remember { mutableStateOf<DogWeatherReport?>(null) }
     var weatherError by remember { mutableStateOf<String?>(null) }
@@ -623,8 +660,23 @@ fun DogWalkScreen() {
                 OsmMapContainer(
                     currentLocation = walkState.currentLocation,
                     routePoints = displayedRoute,
-                    isHistoricalRoute = isHistoricalRoute
+                    isHistoricalRoute = isHistoricalRoute,
+                    useCartoTiles = useCartoTiles
                 )
+
+                Button(
+                    onClick = { useCartoTiles = !useCartoTiles },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1E1E1E)),
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = if (useCartoTiles) "Map: Carto" else "Map: OSM",
+                        color = Color.White,
+                        fontSize = 11.sp
+                    )
+                }
             }
 
             WalkControlPanel(
@@ -895,19 +947,26 @@ fun MetricPill(label: String, value: String, modifier: Modifier = Modifier) {
 fun OsmMapContainer(
     currentLocation: GeoPoint?,
     routePoints: List<GeoPoint>,
-    isHistoricalRoute: Boolean
+    isHistoricalRoute: Boolean,
+    useCartoTiles: Boolean
 ) {
+    val activeTileSource = if (useCartoTiles) CARTO_VOYAGER_SOURCE else OSM_DIRECT_SOURCE
+
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
             MapView(ctx).apply {
-                setTileSource(TileSourceFactory.MAPNIK)
+                setTileSource(activeTileSource)
                 setMultiTouchControls(true)
                 controller.setZoom(17.5)
                 controller.setCenter(currentLocation ?: GeoPoint(42.375, -122.916))
             }
         },
         update = { mapView ->
+            if (mapView.tileProvider.tileSource.name() != activeTileSource.name()) {
+                mapView.setTileSource(activeTileSource)
+            }
+
             mapView.overlays.clear()
 
             if (routePoints.size > 1) {
