@@ -25,7 +25,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,12 +39,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -154,7 +158,6 @@ object WeatherRepository {
                 val solarRad = weatherJson.optDouble("shortwave_radiation", 0.0)
                 val aqi = aqiJson.optInt("us_aqi", 25)
 
-                // Sunlit dark asphalt estimate in Fahrenheit: T_air_F + (0.045 * solarRad)
                 val estPavement = ((airTemp + (0.045 * solarRad)) * 10.0).roundToInt() / 10.0
 
                 val (status, reason) = evaluateThresholds(
@@ -223,7 +226,7 @@ object WeatherRepository {
         connection.connectTimeout = 8000
         connection.readTimeout = 8000
         connection.requestMethod = "GET"
-        connection.setRequestProperty("User-Agent", "PersonalDogWalkTracker/3.1 (Android)")
+        connection.setRequestProperty("User-Agent", "PersonalDogWalkTracker/3.2 (Android)")
         return connection.inputStream.bufferedReader().use { it.readText() }
     }
 }
@@ -252,7 +255,7 @@ object RouteSnapper {
                     conn.connectTimeout = 6000
                     conn.readTimeout = 6000
                     conn.requestMethod = "GET"
-                    conn.setRequestProperty("User-Agent", "PersonalDogWalkTracker/3.1 (Android)")
+                    conn.setRequestProperty("User-Agent", "PersonalDogWalkTracker/3.2 (Android)")
 
                     if (conn.responseCode == 200) {
                         val responseText = conn.inputStream.bufferedReader().use { it.readText() }
@@ -274,21 +277,20 @@ object RouteSnapper {
                         }
                     }
                 } catch (_: Exception) {
-                    // Try next endpoint or fall back to straight line
                 }
             }
-            // Offline / fallback straight segment
             listOf(start, end)
         }
 }
 
 // ============================================================================
-// 3. ROOM SQLITE DATABASE (VERSION 3 - WALKS + PLANNED ROUTES)
+// 3. ROOM SQLITE DATABASE (VERSION 4 - SUPPORTS ROUTE NAMING)
 // ============================================================================
 
 @Entity(tableName = "walk_records")
 data class WalkRecord(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val routeName: String = "",
     val timestampMillis: Long,
     val distanceMeters: Double,
     val durationSeconds: Long,
@@ -337,7 +339,8 @@ data class WalkRecord(
     }
 
     fun toMarkdownRow(): String {
-        return "| ${formattedDate()} | ${formattedDistanceMiles()} | ${formattedDuration()} | ${formattedPace()} | ${airTempF}°F / ${pavementTempF}°F | $safetyStatus |"
+        val nameCol = if (routeName.isNotBlank()) "($routeName)" else ""
+        return "| ${formattedDate()} $nameCol | ${formattedDistanceMiles()} | ${formattedDuration()} | ${formattedPace()} | ${airTempF}°F / ${pavementTempF}°F | $safetyStatus |"
     }
 
     companion object {
@@ -358,7 +361,7 @@ interface WalkDao {
     suspend fun deleteWalk(walk: WalkRecord)
 }
 
-@Database(entities = [WalkRecord::class], version = 3, exportSchema = false)
+@Database(entities = [WalkRecord::class], version = 4, exportSchema = false)
 abstract class WalkDatabase : RoomDatabase() {
     abstract fun walkDao(): WalkDao
 
@@ -383,7 +386,7 @@ abstract class WalkDatabase : RoomDatabase() {
 }
 
 // ============================================================================
-// 4. FOREGROUND GPS LOCATION SERVICE & DISTANCE HELPER
+// 4. FOREGROUND GPS LOCATION SERVICE
 // ============================================================================
 
 fun calculatePolylineMeters(points: List<GeoPoint>): Double {
@@ -564,30 +567,15 @@ class WalkTrackerService : Service() {
 }
 
 // ============================================================================
-// 5. KEYLESS TILE SOURCES, GHOST MODES & MAIN UI
+// 5. MAP UI & COMPACT WEATHER
 // ============================================================================
 
-val OSM_KEYLESS_SOURCE = XYTileSource(
-    "OSM_Keyless_v3",
-    0,
-    19,
-    256,
-    ".png",
-    arrayOf("https://tile.openstreetmap.org/")
-)
-
+val OSM_KEYLESS_SOURCE = XYTileSource("OSM_Keyless_v3", 0, 19, 256, ".png", arrayOf("https://tile.openstreetmap.org/"))
 val ESRI_STREET_SOURCE = object : OnlineTileSourceBase(
-    "EsriWorldStreet_v3",
-    0,
-    19,
-    256,
-    "",
-    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/")
+    "EsriWorldStreet_v3", 0, 19, 256, "", arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/")
 ) {
     override fun getTileURLString(pMapTileIndex: Long): String {
-        return baseUrl + MapTileIndex.getZoom(pMapTileIndex) + "/" +
-            MapTileIndex.getY(pMapTileIndex) + "/" +
-            MapTileIndex.getX(pMapTileIndex)
+        return baseUrl + MapTileIndex.getZoom(pMapTileIndex) + "/" + MapTileIndex.getY(pMapTileIndex) + "/" + MapTileIndex.getX(pMapTileIndex)
     }
 }
 
@@ -595,7 +583,6 @@ enum class MapStyle(val label: String, val source: OnlineTileSourceBase, val inv
     DARK("Dark", OSM_KEYLESS_SOURCE, true),
     LIGHT("Light", OSM_KEYLESS_SOURCE, false),
     ESRI("Esri", ESRI_STREET_SOURCE, false);
-
     fun next(): MapStyle {
         val values = entries
         return values[(ordinal + 1) % values.size]
@@ -603,10 +590,7 @@ enum class MapStyle(val label: String, val source: OnlineTileSourceBase, val inv
 }
 
 enum class GhostMode(val label: String) {
-    OFF("Ghost: OFF"),
-    PINNED("Ghost: PINNED"),
-    ALL("Ghost: ALL");
-
+    OFF("Ghost: OFF"), PINNED("Ghost: PINNED"), ALL("Ghost: ALL");
     fun next(): GhostMode {
         val values = entries
         return values[(ordinal + 1) % values.size]
@@ -616,20 +600,16 @@ enum class GhostMode(val label: String) {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         val osmConfig = Configuration.getInstance()
         val prefs = getSharedPreferences("osmdroid_clean_prefs_v3", Context.MODE_PRIVATE)
         osmConfig.load(applicationContext, prefs)
-
-        val customUa = "PersonalDogWalkTracker/3.1 (Android; PersonalUse)"
+        val customUa = "PersonalDogWalkTracker/3.2 (Android; PersonalUse)"
         osmConfig.userAgentValue = customUa
         osmConfig.additionalHttpRequestProperties["User-Agent"] = customUa
         osmConfig.additionalHttpRequestProperties["Referer"] = "https://www.openstreetmap.org/"
-
         val cleanCacheDir = File(cacheDir, "osm_tiles_v3")
         cleanCacheDir.mkdirs()
         osmConfig.osmdroidTileCache = cleanCacheDir
-
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF121212)) {
@@ -659,21 +639,19 @@ fun DogWalkScreen() {
     var ghostMode by remember { mutableStateOf(GhostMode.PINNED) }
     var pinnedGhostWalk by remember { mutableStateOf<WalkRecord?>(null) }
 
-    // Route Builder + Street Snapping state
     var isPlanningRoute by remember { mutableStateOf(false) }
     var snapToStreets by remember { mutableStateOf(true) }
     var isSnappingSegment by remember { mutableStateOf(false) }
     var plannedLegs by remember { mutableStateOf<List<PlannedLeg>>(emptyList()) }
+    
+    // Name Route Dialog State
+    var showNameDialog by remember { mutableStateOf(false) }
+    var routeNameInput by remember { mutableStateOf("") }
 
-    val plannedFullGeometry = remember(plannedLegs) {
-        plannedLegs.flatMap { it.snappedPoints }
-    }
-    val plannedAnchorWaypoints = remember(plannedLegs) {
-        plannedLegs.map { it.anchor }
-    }
+    val plannedFullGeometry = remember(plannedLegs) { plannedLegs.flatMap { it.snappedPoints } }
+    val plannedAnchorWaypoints = remember(plannedLegs) { plannedLegs.map { it.anchor } }
 
     var activeTab by remember { mutableIntStateOf(0) }
-
     var weatherReport by remember { mutableStateOf<DogWeatherReport?>(null) }
     var weatherError by remember { mutableStateOf<String?>(null) }
     var isLoadingWeather by remember { mutableStateOf(false) }
@@ -687,7 +665,6 @@ fun DogWalkScreen() {
             val targetLat = loc?.latitude ?: 42.375
             val targetLon = loc?.longitude ?: -122.916
             WalkStateHolder.updateLocation(GeoPoint(targetLat, targetLon), trackRoute = false)
-
             scope.launch {
                 val res = WeatherRepository.fetchDogWeather(targetLat, targetLon)
                 isLoadingWeather = false
@@ -725,24 +702,14 @@ fun DogWalkScreen() {
         }
     }
 
-    val ghostPacerPoint: GeoPoint? = remember(
-        walkState.isTracking,
-        walkState.elapsedSeconds,
-        ghostMode,
-        activeGhostRecord
-    ) {
-        if (!walkState.isTracking || ghostMode == GhostMode.OFF || activeGhostRecord == null) {
-            null
-        } else {
+    val ghostPacerPoint: GeoPoint? = remember(walkState.isTracking, walkState.elapsedSeconds, ghostMode, activeGhostRecord) {
+        if (!walkState.isTracking || ghostMode == GhostMode.OFF || activeGhostRecord == null) null
+        else {
             val pts = activeGhostRecord.toGeoPoints()
             if (pts.size < 2) null
             else {
-                val targetDuration = if (activeGhostRecord.durationSeconds > 0) {
-                    activeGhostRecord.durationSeconds
-                } else {
-                    val miles = activeGhostRecord.distanceMeters / 1609.34
-                    (miles * 20.0 * 60.0).toLong().coerceAtLeast(60L)
-                }
+                val targetDuration = if (activeGhostRecord.durationSeconds > 0) activeGhostRecord.durationSeconds
+                else ((activeGhostRecord.distanceMeters / 1609.34) * 20.0 * 60.0).toLong().coerceAtLeast(60L)
                 val fraction = (walkState.elapsedSeconds.toDouble() / targetDuration.toDouble()).coerceIn(0.0, 1.0)
                 val index = ((pts.size - 1) * fraction).roundToInt().coerceIn(0, pts.size - 1)
                 pts[index]
@@ -750,189 +717,126 @@ fun DogWalkScreen() {
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        // TOP TAB BAR
+    if (showNameDialog) {
+        AlertDialog(
+            onDismissRequest = { showNameDialog = false },
+            title = { Text("Save Route") },
+            text = {
+                OutlinedTextField(
+                    value = routeNameInput,
+                    onValueChange = { routeNameInput = it },
+                    label = { Text("Route Name (Optional)") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showNameDialog = false
+                    val plannedMeters = calculatePolylineMeters(plannedFullGeometry)
+                    scope.launch {
+                        val newRoute = WalkRecord(
+                            timestampMillis = System.currentTimeMillis(),
+                            routeName = routeNameInput.trim(),
+                            distanceMeters = plannedMeters,
+                            durationSeconds = 0L,
+                            airTempF = weatherReport?.airTempF ?: 0.0,
+                            pavementTempF = weatherReport?.pavementTempF ?: 0.0,
+                            safetyStatus = "PLANNED",
+                            routeSerialized = WalkRecord.serializeRoute(plannedFullGeometry)
+                        )
+                        walkDao.insertWalk(newRoute)
+                        pinnedGhostWalk = newRoute
+                        ghostMode = GhostMode.PINNED
+                        plannedLegs = emptyList()
+                        isPlanningRoute = false
+                        routeNameInput = ""
+                        Toast.makeText(context, "Route saved & set as Ghost Trail!", Toast.LENGTH_SHORT).show()
+                    }
+                }) {
+                    Text("Save Route")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNameDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF1E1E1E), RoundedCornerShape(10.dp))
-                .padding(4.dp),
+            modifier = Modifier.fillMaxWidth().background(Color(0xFF1E1E1E), RoundedCornerShape(10.dp)).padding(4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Button(
                 onClick = { activeTab = 0 },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (activeTab == 0) Color(0xFF2E7D32) else Color.Transparent
-                ),
+                colors = ButtonDefaults.buttonColors(containerColor = if (activeTab == 0) Color(0xFF2E7D32) else Color.Transparent),
                 modifier = Modifier.weight(1f)
-            ) {
-                Text("LIVE MAP", color = Color.White, fontWeight = FontWeight.Bold)
-            }
+            ) { Text("LIVE MAP", color = Color.White, fontWeight = FontWeight.Bold) }
             Button(
                 onClick = { activeTab = 1 },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (activeTab == 1) Color(0xFF2E7D32) else Color.Transparent
-                ),
+                colors = ButtonDefaults.buttonColors(containerColor = if (activeTab == 1) Color(0xFF2E7D32) else Color.Transparent),
                 modifier = Modifier.weight(1f)
-            ) {
-                Text("ROUTES & LOGS (${savedWalks.size})", color = Color.White, fontWeight = FontWeight.Bold)
-            }
+            ) { Text("ROUTES & LOGS (${savedWalks.size})", color = Color.White, fontWeight = FontWeight.Bold) }
         }
 
         if (activeTab == 0) {
-            // 1. WEATHER BANNER
-            WeatherBanner(
-                report = weatherReport,
-                isLoading = isLoadingWeather,
-                error = weatherError,
-                onRefresh = { refreshLocationAndWeather() }
-            )
+            WeatherBanner(report = weatherReport, isLoading = isLoadingWeather, error = weatherError, onRefresh = { refreshLocationAndWeather() })
 
-            // 2. ROUTE BUILDER TOOLBAR (With OSRM Street Snapping)
             if (isPlanningRoute) {
                 val plannedMeters = calculatePolylineMeters(plannedFullGeometry)
                 val plannedMiles = plannedMeters / 1609.34
-
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF3E2723), RoundedCornerShape(10.dp))
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier.fillMaxWidth().background(Color(0xFF3E2723), RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = if (isSnappingSegment) {
-                                "Snapping to trail..."
-                            } else {
-                                String.format(Locale.US, "Plan: %.2f mi (%d stops)", plannedMiles, plannedLegs.size)
-                            },
-                            color = Color(0xFFFFD600),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
+                            text = if (isSnappingSegment) "Snapping to trail..." else String.format(Locale.US, "Plan: %.2f mi (%d stops)", plannedMiles, plannedLegs.size),
+                            color = Color(0xFFFFD600), fontWeight = FontWeight.Bold, fontSize = 13.sp
                         )
-                        Text(
-                            text = if (snapToStreets) "OSRM Foot Routing: ON" else "Straight Line Mode",
-                            color = Color.LightGray,
-                            fontSize = 11.sp
-                        )
+                        Text(text = if (snapToStreets) "OSRM Foot Routing: ON" else "Straight Line Mode", color = Color.LightGray, fontSize = 11.sp)
                     }
-
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         OutlinedButton(
                             onClick = { snapToStreets = !snapToStreets },
                             contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                text = if (snapToStreets) "Snap: ON" else "Snap: OFF",
-                                fontSize = 10.sp,
-                                color = if (snapToStreets) Color(0xFF00E676) else Color.LightGray
-                            )
-                        }
+                        ) { Text(if (snapToStreets) "Snap: ON" else "Snap: OFF", fontSize = 10.sp, color = if (snapToStreets) Color(0xFF00E676) else Color.LightGray) }
                         OutlinedButton(
-                            onClick = {
-                                if (plannedLegs.isNotEmpty() && !isSnappingSegment) {
-                                    plannedLegs = plannedLegs.dropLast(1)
-                                }
-                            },
+                            onClick = { if (plannedLegs.isNotEmpty() && !isSnappingSegment) plannedLegs = plannedLegs.dropLast(1) },
                             contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
-                        ) {
-                            Text("Undo", fontSize = 10.sp, color = Color.White)
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                if (!isSnappingSegment) plannedLegs = emptyList()
-                            },
-                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
-                        ) {
-                            Text("Clear", fontSize = 10.sp, color = Color.White)
-                        }
+                        ) { Text("Undo", fontSize = 10.sp, color = Color.White) }
                         Button(
                             onClick = {
-                                if (plannedFullGeometry.size >= 2 && !isSnappingSegment) {
-                                    scope.launch {
-                                        val newRoute = WalkRecord(
-                                            timestampMillis = System.currentTimeMillis(),
-                                            distanceMeters = plannedMeters,
-                                            durationSeconds = 0L,
-                                            airTempF = weatherReport?.airTempF ?: 0.0,
-                                            pavementTempF = weatherReport?.pavementTempF ?: 0.0,
-                                            safetyStatus = "PLANNED",
-                                            routeSerialized = WalkRecord.serializeRoute(plannedFullGeometry)
-                                        )
-                                        walkDao.insertWalk(newRoute)
-                                        pinnedGhostWalk = newRoute
-                                        ghostMode = GhostMode.PINNED
-                                        plannedLegs = emptyList()
-                                        isPlanningRoute = false
-                                        Toast.makeText(context, "Snapped route saved as Ghost Trail!", Toast.LENGTH_SHORT).show()
-                                    }
-                                } else {
-                                    Toast.makeText(context, "Tap at least 2 points on the map", Toast.LENGTH_SHORT).show()
-                                }
+                                if (plannedFullGeometry.size >= 2 && !isSnappingSegment) showNameDialog = true
+                                else Toast.makeText(context, "Tap at least 2 points", Toast.LENGTH_SHORT).show()
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF8F00)),
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                        ) {
-                            Text("Save", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.Bold)
-                        }
+                        ) { Text("Save", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.Bold) }
                     }
                 }
             }
 
-            // 3. CLIPPED MAP VIEW CONTAINER
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .clipToBounds()
-            ) {
+            Box(modifier = Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(12.dp)).clipToBounds()) {
                 OsmMapContainer(
-                    currentLocation = walkState.currentLocation,
-                    liveRoutePoints = walkState.routePoints,
-                    ghostTrails = ghostTrailsToRender,
-                    ghostPacerPoint = ghostPacerPoint,
-                    plannedGeometry = plannedFullGeometry,
-                    plannedAnchors = plannedAnchorWaypoints,
-                    isPlanningRoute = isPlanningRoute,
-                    mapStyle = mapStyle,
+                    currentLocation = walkState.currentLocation, liveRoutePoints = walkState.routePoints,
+                    ghostTrails = ghostTrailsToRender, ghostPacerPoint = ghostPacerPoint,
+                    plannedGeometry = plannedFullGeometry, plannedAnchors = plannedAnchorWaypoints,
+                    isPlanningRoute = isPlanningRoute, mapStyle = mapStyle,
                     onMapTap = { tappedGeoPoint ->
                         if (isPlanningRoute && !isSnappingSegment) {
                             if (plannedLegs.isEmpty()) {
-                                plannedLegs = listOf(
-                                    PlannedLeg(
-                                        anchor = tappedGeoPoint,
-                                        snappedPoints = listOf(tappedGeoPoint)
-                                    )
-                                )
+                                plannedLegs = listOf(PlannedLeg(anchor = tappedGeoPoint, snappedPoints = listOf(tappedGeoPoint)))
                             } else {
                                 val prevAnchor = plannedLegs.last().anchor
                                 if (!snapToStreets) {
-                                    plannedLegs = plannedLegs + PlannedLeg(
-                                        anchor = tappedGeoPoint,
-                                        snappedPoints = listOf(tappedGeoPoint)
-                                    )
+                                    plannedLegs = plannedLegs + PlannedLeg(anchor = tappedGeoPoint, snappedPoints = listOf(tappedGeoPoint))
                                 } else {
                                     isSnappingSegment = true
                                     scope.launch {
                                         val segmentPoints = RouteSnapper.snapFootSegment(prevAnchor, tappedGeoPoint)
-                                        // Drop the first point if it duplicates prevAnchor
-                                        val cleanedSegment = if (segmentPoints.size > 1) {
-                                            segmentPoints.drop(1)
-                                        } else {
-                                            segmentPoints
-                                        }
-                                        plannedLegs = plannedLegs + PlannedLeg(
-                                            anchor = tappedGeoPoint,
-                                            snappedPoints = cleanedSegment
-                                        )
+                                        val cleanedSegment = if (segmentPoints.size > 1) segmentPoints.drop(1) else segmentPoints
+                                        plannedLegs = plannedLegs + PlannedLeg(anchor = tappedGeoPoint, snappedPoints = cleanedSegment)
                                         isSnappingSegment = false
                                     }
                                 }
@@ -941,38 +845,21 @@ fun DogWalkScreen() {
                     }
                 )
 
-                // TOP MAP OVERLAY CONTROLS
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.TopCenter)
-                        .padding(8.dp),
+                    modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Button(
                         onClick = { ghostMode = ghostMode.next() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (ghostMode != GhostMode.OFF) Color(0xCC006064) else Color(0xCC1E1E1E)
-                        ),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (ghostMode != GhostMode.OFF) Color(0xCC006064) else Color(0xCC1E1E1E)),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Text(text = ghostMode.label, color = Color.White, fontSize = 11.sp)
-                    }
+                    ) { Text(text = ghostMode.label, color = Color.White, fontSize = 11.sp) }
 
                     Button(
                         onClick = { isPlanningRoute = !isPlanningRoute },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isPlanningRoute) Color(0xFFFF8F00) else Color(0xCC1E1E1E)
-                        ),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (isPlanningRoute) Color(0xFFFF8F00) else Color(0xCC1E1E1E)),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = if (isPlanningRoute) "Planning: ON" else "Plan Route",
-                            color = if (isPlanningRoute) Color.Black else Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 11.sp
-                        )
-                    }
+                    ) { Text(text = if (isPlanningRoute) "Planning: ON" else "Plan Route", color = if (isPlanningRoute) Color.Black else Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp) }
 
                     Button(
                         onClick = {
@@ -982,63 +869,38 @@ fun DogWalkScreen() {
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1E1E1E)),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = "Map: ${mapStyle.label}",
-                            color = Color.White,
-                            fontSize = 11.sp
-                        )
-                    }
+                    ) { Text(text = "Map: ${mapStyle.label}", color = Color.White, fontSize = 11.sp) }
                 }
             }
 
-            // 4. WALK TELEMETRY & CONTROLS
             WalkControlPanel(
                 walkState = walkState,
-                ghostTargetMiles = if (ghostMode != GhostMode.OFF) {
-                    activeGhostRecord?.let { it.distanceMeters / 1609.34 }
-                } else null,
+                ghostTargetMiles = if (ghostMode != GhostMode.OFF) activeGhostRecord?.let { it.distanceMeters / 1609.34 } else null,
                 onToggleWalk = {
                     if (walkState.isTracking) {
                         val snapshotDist = walkState.distanceMeters
                         val snapshotSecs = walkState.elapsedSeconds
                         val snapshotPoints = walkState.routePoints
-
                         scope.launch {
                             val record = WalkRecord(
-                                timestampMillis = System.currentTimeMillis(),
-                                distanceMeters = snapshotDist,
-                                durationSeconds = snapshotSecs,
-                                airTempF = weatherReport?.airTempF ?: 0.0,
-                                pavementTempF = weatherReport?.pavementTempF ?: 0.0,
-                                safetyStatus = weatherReport?.status?.name ?: "N/A",
-                                routeSerialized = WalkRecord.serializeRoute(snapshotPoints)
+                                timestampMillis = System.currentTimeMillis(), distanceMeters = snapshotDist, durationSeconds = snapshotSecs,
+                                airTempF = weatherReport?.airTempF ?: 0.0, pavementTempF = weatherReport?.pavementTempF ?: 0.0,
+                                safetyStatus = weatherReport?.status?.name ?: "N/A", routeSerialized = WalkRecord.serializeRoute(snapshotPoints)
                             )
                             walkDao.insertWalk(record)
                             Toast.makeText(context, "Walk saved to history", Toast.LENGTH_SHORT).show()
                         }
-
-                        val stopIntent = Intent(context, WalkTrackerService::class.java).apply {
-                            action = WalkTrackerService.ACTION_STOP
-                        }
-                        context.startService(stopIntent)
+                        context.startService(Intent(context, WalkTrackerService::class.java).apply { action = WalkTrackerService.ACTION_STOP })
                     } else {
-                        val startIntent = Intent(context, WalkTrackerService::class.java).apply {
-                            action = WalkTrackerService.ACTION_START
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            context.startForegroundService(startIntent)
-                        } else {
-                            context.startService(startIntent)
-                        }
+                        val startIntent = Intent(context, WalkTrackerService::class.java).apply { action = WalkTrackerService.ACTION_START }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(startIntent)
+                        else context.startService(startIntent)
                     }
                 }
             )
         } else {
-            // WALK HISTORY & SAVED ROUTES SCREEN
             WalkHistoryList(
-                walks = savedWalks,
-                pinnedGhostId = activeGhostRecord?.id,
+                walks = savedWalks, pinnedGhostId = activeGhostRecord?.id,
                 onSetGhost = { walk ->
                     pinnedGhostWalk = walk
                     ghostMode = GhostMode.PINNED
@@ -1056,146 +918,58 @@ fun DogWalkScreen() {
 
 @Composable
 fun OsmMapContainer(
-    currentLocation: GeoPoint?,
-    liveRoutePoints: List<GeoPoint>,
-    ghostTrails: List<List<GeoPoint>>,
-    ghostPacerPoint: GeoPoint?,
-    plannedGeometry: List<GeoPoint>,
-    plannedAnchors: List<GeoPoint>,
-    isPlanningRoute: Boolean,
-    mapStyle: MapStyle,
-    onMapTap: (GeoPoint) -> Unit
+    currentLocation: GeoPoint?, liveRoutePoints: List<GeoPoint>, ghostTrails: List<List<GeoPoint>>, ghostPacerPoint: GeoPoint?,
+    plannedGeometry: List<GeoPoint>, plannedAnchors: List<GeoPoint>, isPlanningRoute: Boolean, mapStyle: MapStyle, onMapTap: (GeoPoint) -> Unit
 ) {
     val currentOnMapTap by androidx.compose.runtime.rememberUpdatedState(onMapTap)
     val currentIsPlanning by androidx.compose.runtime.rememberUpdatedState(isPlanningRoute)
 
     AndroidView(
-        modifier = Modifier
-            .fillMaxSize()
-            .clipToBounds(),
+        modifier = Modifier.fillMaxSize().clipToBounds(),
         factory = { ctx ->
             FrameLayout(ctx).apply {
-                clipChildren = true
-                clipToPadding = true
-                clipToOutline = true
-                outlineProvider = object : ViewOutlineProvider() {
-                    override fun getOutline(view: View, outline: Outline) {
-                        outline.setRect(0, 0, view.width, view.height)
-                    }
-                }
-
+                clipChildren = true; clipToPadding = true; clipToOutline = true
+                outlineProvider = object : ViewOutlineProvider() { override fun getOutline(view: View, outline: Outline) { outline.setRect(0, 0, view.width, view.height) } }
                 val mapView = MapView(ctx).apply {
-                    setTileSource(mapStyle.source)
-                    setMultiTouchControls(true)
+                    setTileSource(mapStyle.source); setMultiTouchControls(true)
                     overlayManager.tilesOverlay.loadingBackgroundColor = android.graphics.Color.parseColor("#121212")
                     overlayManager.tilesOverlay.loadingLineColor = android.graphics.Color.parseColor("#262626")
-                    controller.setZoom(17.0)
-                    controller.setCenter(currentLocation ?: GeoPoint(42.375, -122.916))
+                    controller.setZoom(17.0); controller.setCenter(currentLocation ?: GeoPoint(42.375, -122.916))
                 }
-                addView(
-                    mapView,
-                    FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.MATCH_PARENT
-                    )
-                )
+                addView(mapView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             }
         },
         update = { container ->
             val mapView = container.getChildAt(0) as MapView
-
-            if (mapView.tileProvider.tileSource.name() != mapStyle.source.name()) {
-                mapView.setTileSource(mapStyle.source)
-            }
-
-            mapView.overlayManager.tilesOverlay.setColorFilter(
-                if (mapStyle.invertForDark) TilesOverlay.INVERT_COLORS else null
-            )
-
+            if (mapView.tileProvider.tileSource.name() != mapStyle.source.name()) mapView.setTileSource(mapStyle.source)
+            mapView.overlayManager.tilesOverlay.setColorFilter(if (mapStyle.invertForDark) TilesOverlay.INVERT_COLORS else null)
             mapView.overlays.clear()
 
-            // 1. Tap listener overlay for Route Planning
-            val tapReceiver = object : MapEventsReceiver {
+            mapView.overlays.add(MapEventsOverlay(object : MapEventsReceiver {
                 override fun singleTapConfirmedHelper(p: GeoPoint?): Boolean {
-                    if (currentIsPlanning && p != null) {
-                        currentOnMapTap(p)
-                        return true
-                    }
+                    if (currentIsPlanning && p != null) { currentOnMapTap(p); return true }
                     return false
                 }
-
                 override fun longPressHelper(p: GeoPoint?): Boolean = false
-            }
-            mapView.overlays.add(MapEventsOverlay(tapReceiver))
+            }))
 
-            // 2. Render Ghost Trails (semi-transparent cyan/purple under-layer)
             ghostTrails.forEachIndexed { idx, ghostPoints ->
                 if (ghostPoints.size > 1) {
-                    val ghostLine = Polyline().apply {
-                        setPoints(ghostPoints)
-                        outlinePaint.color = if (idx == 0) {
-                            android.graphics.Color.parseColor("#9900E5FF")
-                        } else {
-                            android.graphics.Color.parseColor("#66B388FF")
-                        }
-                        outlinePaint.strokeWidth = 12f
-                    }
-                    mapView.overlays.add(ghostLine)
+                    mapView.overlays.add(Polyline().apply { setPoints(ghostPoints); outlinePaint.color = if (idx == 0) android.graphics.Color.parseColor("#9900E5FF") else android.graphics.Color.parseColor("#66B388FF"); outlinePaint.strokeWidth = 12f })
                 }
             }
 
-            // 3. Render Ghost Pacer Marker
-            ghostPacerPoint?.let { ghostPt ->
-                val ghostMarker = Marker(mapView).apply {
-                    position = ghostPt
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                    title = "Ghost Pacer"
-                    alpha = 0.8f
-                }
-                mapView.overlays.add(ghostMarker)
-            }
+            ghostPacerPoint?.let { ghostPt -> mapView.overlays.add(Marker(mapView).apply { position = ghostPt; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER); title = "Ghost Pacer"; alpha = 0.8f }) }
 
-            // 4. Render Street-Snapped Planned Route Line (Gold) & User Tap Anchors
-            if (plannedGeometry.size > 1) {
-                val planLine = Polyline().apply {
-                    setPoints(plannedGeometry)
-                    outlinePaint.color = android.graphics.Color.parseColor("#FFD600")
-                    outlinePaint.strokeWidth = 12f
-                }
-                mapView.overlays.add(planLine)
-            }
-            plannedAnchors.forEachIndexed { index, pt ->
-                val wpMarker = Marker(mapView).apply {
-                    position = pt
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                    title = "Stop ${index + 1}"
-                }
-                mapView.overlays.add(wpMarker)
-            }
+            if (plannedGeometry.size > 1) mapView.overlays.add(Polyline().apply { setPoints(plannedGeometry); outlinePaint.color = android.graphics.Color.parseColor("#FFD600"); outlinePaint.strokeWidth = 12f })
+            plannedAnchors.forEachIndexed { index, pt -> mapView.overlays.add(Marker(mapView).apply { position = pt; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM); title = "Stop ${index + 1}" }) }
 
-            // 5. Render Active Live Walk Route (Bright Green)
-            if (liveRoutePoints.size > 1) {
-                val liveLine = Polyline().apply {
-                    setPoints(liveRoutePoints)
-                    outlinePaint.color = android.graphics.Color.parseColor("#00E676")
-                    outlinePaint.strokeWidth = 14f
-                }
-                mapView.overlays.add(liveLine)
-            }
+            if (liveRoutePoints.size > 1) mapView.overlays.add(Polyline().apply { setPoints(liveRoutePoints); outlinePaint.color = android.graphics.Color.parseColor("#00E676"); outlinePaint.strokeWidth = 14f })
 
-            // 6. Render Current GPS Location Marker
             currentLocation?.let { loc ->
-                val marker = Marker(mapView).apply {
-                    position = loc
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                    title = "Current Location"
-                }
-                mapView.overlays.add(marker)
-                if (!currentIsPlanning) {
-                    mapView.controller.animateTo(loc)
-                }
+                mapView.overlays.add(Marker(mapView).apply { position = loc; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM); title = "Current Location" })
+                if (!currentIsPlanning) mapView.controller.animateTo(loc)
             }
-
             mapView.invalidate()
         }
     )
@@ -1203,87 +977,47 @@ fun OsmMapContainer(
 
 @Composable
 fun WalkHistoryList(
-    walks: List<WalkRecord>,
-    pinnedGhostId: Long?,
-    onSetGhost: (WalkRecord) -> Unit,
-    onDeleteWalk: (WalkRecord) -> Unit
+    walks: List<WalkRecord>, pinnedGhostId: Long?, onSetGhost: (WalkRecord) -> Unit, onDeleteWalk: (WalkRecord) -> Unit
 ) {
     val context = LocalContext.current
     val completedWalks = walks.filter { !it.isPlannedRoute }
     val totalMiles = completedWalks.sumOf { it.distanceMeters } / 1609.34
 
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
+    Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF1E1E1E), RoundedCornerShape(12.dp))
-                .padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier.fillMaxWidth().background(Color(0xFF1E1E1E), RoundedCornerShape(12.dp)).padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
         ) {
             Column {
-                Text(
-                    text = "Total Walked: ${String.format(Locale.US, "%.2f mi", totalMiles)}",
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "${completedWalks.size} walks • ${walks.size - completedWalks.size} planned routes",
-                    color = Color.Gray,
-                    fontSize = 12.sp
-                )
+                Text(text = "Total Walked: ${String.format(Locale.US, "%.2f mi", totalMiles)}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(text = "${completedWalks.size} walks • ${walks.size - completedWalks.size} planned routes", color = Color.Gray, fontSize = 12.sp)
             }
-
             OutlinedButton(
                 onClick = {
                     val header = "| Date | Distance | Duration | Pace | Air / Pavement | Status |\n|---|---|---|---|---|---|\n"
                     val rows = walks.joinToString("\n") { it.toMarkdownRow() }
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("Walk History Table", header + rows))
+                    (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Walk History Table", header + rows))
                     Toast.makeText(context, "Copied full Markdown table", Toast.LENGTH_SHORT).show()
                 },
                 enabled = walks.isNotEmpty()
-            ) {
-                Text("Copy All MD")
-            }
+            ) { Text("Copy All MD") }
         }
 
         if (walks.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No walks or planned routes saved yet.", color = Color.Gray)
-            }
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No walks or planned routes saved yet.", color = Color.Gray) }
         } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+            LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(walks, key = { it.id }) { walk ->
                     val isPinned = walk.id == pinnedGhostId
                     Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (isPinned) Color(0xFF1A2E35) else Color(0xFF1E1E1E)
-                        ),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
+                        colors = CardDefaults.cardColors(containerColor = if (isPinned) Color(0xFF1A2E35) else Color(0xFF1E1E1E)),
+                        shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()
                     ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                 Text(
-                                    text = walk.formattedDate(),
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp
+                                    text = if (walk.routeName.isNotBlank()) walk.routeName else walk.formattedDate(),
+                                    color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp
                                 )
                                 Text(
                                     text = if (walk.isPlannedRoute) "PLANNED ROUTE" else walk.safetyStatus,
@@ -1294,56 +1028,26 @@ fun WalkHistoryList(
                                         "PLANNED" -> Color(0xFFFFD600)
                                         else -> Color.LightGray
                                     },
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp
+                                    fontWeight = FontWeight.Bold, fontSize = 13.sp
                                 )
                             }
+                            Text(text = "${walk.formattedDistanceMiles()}  •  ${walk.formattedDuration()}  •  ${walk.formattedPace()}", color = Color(0xFF00E676), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            if (!walk.isPlannedRoute) Text(text = "Air: ${walk.airTempF}°F  |  Est. Pavement: ${walk.pavementTempF}°F", color = Color.LightGray, fontSize = 12.sp)
 
-                            Text(
-                                text = "${walk.formattedDistanceMiles()}  •  ${walk.formattedDuration()}  •  ${walk.formattedPace()}",
-                                color = Color(0xFF00E676),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-
-                            if (!walk.isPlannedRoute) {
-                                Text(
-                                    text = "Air: ${walk.airTempF}°F  |  Est. Pavement: ${walk.pavementTempF}°F",
-                                    color = Color.LightGray,
-                                    fontSize = 12.sp
-                                )
-                            }
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button(
                                     onClick = { onSetGhost(walk) },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (isPinned) Color(0xFF00838F) else Color(0xFF37474F)
-                                    ),
+                                    colors = ButtonDefaults.buttonColors(containerColor = if (isPinned) Color(0xFF00838F) else Color(0xFF37474F)),
                                     modifier = Modifier.weight(1.2f)
-                                ) {
-                                    Text(
-                                        text = if (isPinned) "Active Ghost" else "Set Ghost",
-                                        fontSize = 12.sp,
-                                        color = Color.White
-                                    )
-                                }
+                                ) { Text(text = if (isPinned) "Active Ghost" else "Set Ghost", fontSize = 12.sp, color = Color.White) }
                                 OutlinedButton(
                                     onClick = {
-                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                        clipboard.setPrimaryClip(ClipData.newPlainText("Walk Row", walk.toMarkdownRow()))
+                                        (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Walk Row", walk.toMarkdownRow()))
                                         Toast.makeText(context, "Copied Markdown row", Toast.LENGTH_SHORT).show()
                                     },
                                     modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Copy MD", fontSize = 12.sp)
-                                }
-                                TextButton(onClick = { onDeleteWalk(walk) }) {
-                                    Text("Delete", color = Color(0xFFEF5350), fontSize = 12.sp)
-                                }
+                                ) { Text("Copy MD", fontSize = 12.sp) }
+                                TextButton(onClick = { onDeleteWalk(walk) }) { Text("Delete", color = Color(0xFFEF5350), fontSize = 12.sp) }
                             }
                         }
                     }
@@ -1354,12 +1058,8 @@ fun WalkHistoryList(
 }
 
 @Composable
-fun WeatherBanner(
-    report: DogWeatherReport?,
-    isLoading: Boolean,
-    error: String?,
-    onRefresh: () -> Unit
-) {
+fun WeatherBanner(report: DogWeatherReport?, isLoading: Boolean, error: String?, onRefresh: () -> Unit) {
+    var isExpanded by remember { mutableStateOf(true) }
     val bgColor = when (report?.status) {
         SafetyLevel.GO -> Color(0xFF1B5E20)
         SafetyLevel.CAUTION -> Color(0xFFE65100)
@@ -1370,44 +1070,41 @@ fun WeatherBanner(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(bgColor, RoundedCornerShape(12.dp))
-            .padding(10.dp),
+            .clip(RoundedCornerShape(12.dp))
+            .background(bgColor)
+            .clickable { isExpanded = !isExpanded }
+            .padding(10.dp)
+            .animateContentSize(),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = when {
-                    isLoading -> "CHECKING WEATHER..."
-                    error != null -> "WEATHER OFFLINE"
-                    report != null -> "WALK STATUS: ${report.status.name}"
-                    else -> "WAITING FOR GPS..."
-                },
-                color = Color.White,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.Bold
-            )
-            TextButton(onClick = onRefresh) {
-                Text("Refresh", color = Color.White)
+        if (!isExpanded && report != null) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(text = "${report.status.name}  •  ${report.airTempF}°F  •  AQI ${report.usAqi}", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text(text = "▼ Expand", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
             }
-        }
-
-        if (error != null) {
-            Text(text = error, color = Color.White, fontSize = 13.sp)
-        } else if (report != null) {
-            Text(text = report.reason, color = Color.White, fontSize = 13.sp)
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                MetricPill("Air / Chill", "${report.airTempF}°F / ${report.feelsLikeF}°F", Modifier.weight(1f))
-                MetricPill("Pavement", "${report.pavementTempF}°F", Modifier.weight(1f))
-                MetricPill("Rain / Wind", "${report.rainInch}in / ${report.windGustMph.toInt()}mph", Modifier.weight(1f))
-                MetricPill("US AQI", "${report.usAqi}", Modifier.weight(0.7f))
+        } else {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = when {
+                        isLoading -> "CHECKING WEATHER..."
+                        error != null -> "WEATHER OFFLINE"
+                        report != null -> "WALK STATUS: ${report.status.name}"
+                        else -> "WAITING FOR GPS..."
+                    },
+                    color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold
+                )
+                if (report != null) Text(text = "▲ Shrink", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                else TextButton(onClick = onRefresh) { Text("Refresh", color = Color.White) }
+            }
+            if (error != null) Text(text = error, color = Color.White, fontSize = 13.sp)
+            else if (report != null) {
+                Text(text = report.reason, color = Color.White, fontSize = 13.sp)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    MetricPill("Air / Chill", "${report.airTempF}°F / ${report.feelsLikeF}°F", Modifier.weight(1f))
+                    MetricPill("Pavement", "${report.pavementTempF}°F", Modifier.weight(1f))
+                    MetricPill("Rain / Wind", "${report.rainInch}in / ${report.windGustMph.toInt()}mph", Modifier.weight(1f))
+                    MetricPill("US AQI", "${report.usAqi}", Modifier.weight(0.7f))
+                }
             }
         }
     }
@@ -1415,68 +1112,32 @@ fun WeatherBanner(
 
 @Composable
 fun MetricPill(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(
-        modifier = modifier
-            .background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-            .padding(6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
+    Column(modifier = modifier.background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(8.dp)).padding(6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Text(text = label, color = Color.LightGray, fontSize = 11.sp)
         Text(text = value, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
 @Composable
-fun WalkControlPanel(
-    walkState: WalkSessionState,
-    ghostTargetMiles: Double?,
-    onToggleWalk: () -> Unit
-) {
+fun WalkControlPanel(walkState: WalkSessionState, ghostTargetMiles: Double?, onToggleWalk: () -> Unit) {
     val distMiles = walkState.distanceMeters / 1609.34
     val mins = walkState.elapsedSeconds / 60
     val secs = walkState.elapsedSeconds % 60
     val durationFormatted = String.format(Locale.US, "%02d:%02d", mins, secs)
+    val paceStr = if (distMiles >= 0.03) String.format(Locale.US, "%.1f min/mi", (walkState.elapsedSeconds / 60.0) / distMiles) else "-- min/mi"
+    val distLabel = if (ghostTargetMiles != null && ghostTargetMiles > 0.0) String.format(Locale.US, "%.2f / %.2f mi", distMiles, ghostTargetMiles) else String.format(Locale.US, "%.2f mi", distMiles)
 
-    val paceStr = if (distMiles >= 0.03) {
-        val paceMinPerMile = (walkState.elapsedSeconds / 60.0) / distMiles
-        String.format(Locale.US, "%.1f min/mi", paceMinPerMile)
-    } else "-- min/mi"
-
-    val distLabel = if (ghostTargetMiles != null && ghostTargetMiles > 0.0) {
-        String.format(Locale.US, "%.2f / %.2f mi", distMiles, ghostTargetMiles)
-    } else {
-        String.format(Locale.US, "%.2f mi", distMiles)
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFF1E1E1E), RoundedCornerShape(12.dp))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
-        ) {
+    Column(modifier = Modifier.fillMaxWidth().background(Color(0xFF1E1E1E), RoundedCornerShape(12.dp)).padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             StatBlock("Distance / Ghost", distLabel)
             StatBlock("Duration", durationFormatted)
             StatBlock("Pace", paceStr)
         }
-
         Button(
             onClick = onToggleWalk,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (walkState.isTracking) Color(0xFFD32F2F) else Color(0xFF2E7D32)
-            ),
+            colors = ButtonDefaults.buttonColors(containerColor = if (walkState.isTracking) Color(0xFFD32F2F) else Color(0xFF2E7D32)),
             modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(
-                text = if (walkState.isTracking) "STOP & SAVE WALK" else "START WALK",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-        }
+        ) { Text(text = if (walkState.isTracking) "STOP & SAVE WALK" else "START WALK", color = Color.White, fontWeight = FontWeight.Bold) }
     }
 }
 
