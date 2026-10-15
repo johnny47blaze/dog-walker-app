@@ -12,8 +12,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v5
 
-      - name: Generate Configs and App Icon
+      - name: Install ImageMagick and Generate Icon
         run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           
           # Create default green icon or crop uploaded image if present
