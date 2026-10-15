@@ -1,0 +1,40 @@
+name: Build Dog Walk APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Generate Root Gradle Boilerplate
+        run: |
+          printf 'pluginManagement {\n  repositories {\n    google()\n    mavenCentral()\n    gradlePluginPortal()\n  }\n}\ndependencyResolutionManagement {\n  repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n  repositories {\n    google()\n    mavenCentral()\n  }\n}\nrootProject.name = "DogWalkTracker"\ninclude(":app")\n' > settings.gradle.kts
+          printf 'plugins {\n  id("com.android.application") version "8.5.2" apply false\n  id("org.jetbrains.kotlin.android") version "1.9.24" apply false\n}\n' > build.gradle.kts
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2048m\n' > gradle.properties
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compile Debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DogWalkTracker-APK
+          path: app/build/outputs/apk/debug/app-de
+          bug.apk
