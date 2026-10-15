@@ -12,17 +12,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v5
 
-      - name: Install ImageMagick and Generate Icon
+      - name: Install ImageMagick, Setup Icon, and Compile
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           
-          # Create default green icon or crop uploaded image if present
+          # Default fallback icon
           convert -size 192x192 canvas:#2E7D32 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          
+          # Search for any uploaded image in the root directory and crop to square icon
           APP_IMAGE=$(find . -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | head -n 1)
           if [ ! -z "$APP_IMAGE" ]; then
             convert "$APP_IMAGE" -resize 192x192^ -gravity center -extent 192x192 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            echo "Successfully applied custom app icon from $APP_IMAGE"
           fi
 
           cat << 'EOF' > settings.gradle.kts
@@ -107,6 +110,42 @@ jobs:
               implementation("androidx.room:room-ktx:$roomVersion")
               kapt("androidx.room:room-compiler:$roomVersion")
           }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="Dog Walk Tracker"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".WalkTrackerService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+              </application>
+          </manifest>
           EOF
 
       - name: Set up JDK 17
