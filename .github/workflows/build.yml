@@ -125,5 +125,4 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: DogWalkTracker-APK
-          path: app/build/outputs/apk/de
-          bug/app-debug.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
