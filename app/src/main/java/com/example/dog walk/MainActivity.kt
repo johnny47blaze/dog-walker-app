@@ -1658,10 +1658,10 @@ fun DogWalkScreen() {
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF10191C))
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(horizontal = if (activeTab == 1) 0.dp else 12.dp, vertical = if (activeTab == 1) 0.dp else 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // THREE CLEAR DESTINATIONS: conditions, map, and saved walks.
+        // Navigation remains visible while the map uses all other available space.
         Row(
             modifier = Modifier.fillMaxWidth()
                 .background(Color(0xFF1C2A2E), RoundedCornerShape(16.dp))
@@ -1702,215 +1702,11 @@ fun DogWalkScreen() {
                 Text("Open map & walk", color = Color.White)
             }
         } else if (activeTab == 1) {
-            // 3. ROUTE BUILDER & SELECTABLE LENGTH SHADE-AWARE AUTO-ROUTER
-            if (isPlanningRoute) {
-                val plannedMiles = calculatePolylineMeters(plannedFullGeometry) / 1609.34
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF222A30), RoundedCornerShape(16.dp))
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                            Text("Route planner", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                            Text(
-                                if (homeLocation != null) "Starting from Home" else "Starting from current GPS location",
-                                color = Color(0xFFB0BEC5), fontSize = 12.sp
-                            )
-                        }
-                        Text(
-                            if (isSnappingSegment) "Finding route…" else "Walking route",
-                            color = Color(0xFF80CBC4), fontSize = 12.sp
-                        )
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("Start → end", "Round trip").forEachIndexed { index, label ->
-                            OutlinedButton(
-                                onClick = {
-                                    pointToPointMode = index == 0
-                                    pickingRoutePoint = 0
-                                    autoLoopMessage = null
-                                },
-                                modifier = Modifier.weight(1f),
-                                colors = ButtonDefaults.outlinedButtonColors(
-                                    containerColor = if (pointToPointMode == (index == 0)) Color(0xFF277D73) else Color.Transparent
-                                )
-                            ) { Text(label, color = Color.White, fontSize = 12.sp) }
-                        }
-                    }
-                    if (pointToPointMode) {
-                        Text("Choose two places on the map. The app will follow walkable streets between them.",
-                            color = Color(0xFFCFD8DC), fontSize = 12.sp)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { pickingRoutePoint = 1 },
-                                modifier = Modifier.weight(1f), enabled = !isSnappingSegment) {
-                                Text(if (routeStart == null) "Set start" else "Change start", color = Color.White, fontSize = 12.sp)
-                            }
-                            OutlinedButton(onClick = { pickingRoutePoint = 2 },
-                                modifier = Modifier.weight(1f), enabled = !isSnappingSegment) {
-                                Text(if (routeEnd == null) "Set end" else "Change end", color = Color.White, fontSize = 12.sp)
-                            }
-                        }
-                        Text(when (pickingRoutePoint) {
-                            1 -> "Tap the map to place your START."
-                            2 -> "Tap the map to place your END."
-                            else -> "Start: ${if (routeStart != null) "selected" else "not set"}  •  End: ${if (routeEnd != null) "selected" else "not set"}"
-                        }, color = Color(0xFF80CBC4), fontSize = 12.sp)
-                        OutlinedButton(onClick = {
-                            routeStart = homeLocation ?: walkState.currentLocation
-                            autoLoopMessage = if (routeStart == null) "GPS unavailable. Set start on the map." else "Start set to Home/GPS."
-                        }, enabled = !isSnappingSegment) {
-                            Text("Use Home / GPS as start", color = Color.White, fontSize = 12.sp)
-                        }
-                    }
-                    if (!pointToPointMode) Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text("TARGET DISTANCE", color = Color(0xFFB0BEC5), fontSize = 10.sp)
-                            Text(String.format(Locale.US, "%.2f mi", targetAutoMiles),
-                                color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                        }
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            OutlinedButton(
-                                enabled = !isSnappingSegment && targetAutoMiles > 0.25,
-                                onClick = {
-                                    targetAutoMiles = (targetAutoMiles - 0.25).coerceAtLeast(0.25)
-                                    prefs.edit().putFloat("target_auto_miles", targetAutoMiles.toFloat()).apply()
-                                    autoLoopMessage = null
-                                },
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
-                            ) { Text("−", color = Color.White, fontSize = 18.sp) }
-                            OutlinedButton(
-                                enabled = !isSnappingSegment && targetAutoMiles < 2.50,
-                                onClick = {
-                                    targetAutoMiles = (targetAutoMiles + 0.25).coerceAtMost(2.50)
-                                    prefs.edit().putFloat("target_auto_miles", targetAutoMiles.toFloat()).apply()
-                                    autoLoopMessage = null
-                                },
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
-                            ) { Text("+", color = Color.White, fontSize = 18.sp) }
-                        }
-                    }
-                    Text(
-                        if (isSnappingSegment) "Checking pedestrian streets and matching your distance…"
-                        else if (plannedFullGeometry.size > 1) String.format(Locale.US, "Current route: %.2f mi • %d stops", plannedMiles, plannedLegs.size)
-                        else if (pointToPointMode) "Set a start and end, then find a walking route."
-                        else "Choose a distance, then generate a loop.",
-                        color = Color(0xFFCFD8DC), fontSize = 12.sp
-                    )
-                    if (autoLoopMessage != null) {
-                        Text(autoLoopMessage!!, color = Color(0xFFFFCC80), fontSize = 12.sp)
-                    }
-
-                    // Row B: Action Buttons
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Button(
-                            onClick = {
-                                val startPt = if (pointToPointMode) routeStart else (homeLocation ?: walkState.currentLocation)
-                                if (pointToPointMode && (routeStart == null || routeEnd == null)) {
-                                    autoLoopMessage = "Set both a start and end point on the map first."
-                                } else if (startPt == null) {
-                                    Toast.makeText(context, "Waiting for GPS or Home location...", Toast.LENGTH_SHORT).show()
-                                } else if (!isSnappingSegment) {
-                                    val dirIdx = yorkieDirectionIndex
-                                    yorkieDirectionIndex = (yorkieDirectionIndex + 1) % 8
-                                    val bearing = ShadeRepository.pickShadiestBearingDeg(startPt, shadeZones, dirIdx)
-                                    isSnappingSegment = true
-                                    autoLoopMessage = null
-                                    scope.launch {
-                                        try {
-                                            val generated = if (pointToPointMode) {
-                                                val destination = routeEnd ?: error("End point not selected")
-                                                val path = RouteSnapper.snapFootSegment(startPt, destination, allowDirectFallback = false)
-                                                if (path.size < 2) error("Pedestrian routing unavailable for these points. Try closer points or retry later.")
-                                                listOf(PlannedLeg(startPt, path), PlannedLeg(destination, emptyList()))
-                                            } else RouteSnapper.generateCalibratedLoop(
-                                                origin = startPt,
-                                                targetMiles = targetAutoMiles,
-                                                bearingDeg = bearing
-                                            )
-                                            plannedLegs = generated
-                                            val actualMi = calculatePolylineMeters(generated.flatMap { it.snappedPoints }) / 1609.344
-                                            autoLoopMessage = String.format(Locale.US, "Ready: %.2f mi pedestrian route", actualMi)
-                                        } catch (e: Exception) {
-                                            autoLoopMessage = e.message ?: "Unable to generate a walking loop. Please try again."
-                                            Toast.makeText(context, autoLoopMessage, Toast.LENGTH_LONG).show()
-                                        } finally {
-                                            isSnappingSegment = false
-                                        }
-                                    }
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00838F)),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                            modifier = Modifier.weight(1.3f)
-                        ) {
-                            Text(if (isSnappingSegment) "Finding…" else if (pointToPointMode) "Find route" else "Generate loop", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold)
-                        }
-
-                        OutlinedButton(
-                            onClick = { snapToStreets = !snapToStreets },
-                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
-                            modifier = Modifier.weight(0.9f)
-                        ) {
-                            Text(
-                                text = if (snapToStreets) "Snap: ON" else "Direct",
-                                fontSize = 11.sp,
-                                color = if (snapToStreets) Color(0xFF00E676) else Color.LightGray
-                            )
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                if (plannedLegs.isNotEmpty() && !isSnappingSegment) {
-                                    plannedLegs = plannedLegs.dropLast(1)
-                                }
-                            },
-                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
-                            modifier = Modifier.weight(0.7f)
-                        ) {
-                            Text("Undo", fontSize = 11.sp, color = Color.White)
-                        }
-
-                        Button(
-                            onClick = {
-                                if (plannedFullGeometry.size >= 2 && !isSnappingSegment) {
-                                    showNameDialog = true
-                                } else {
-                                    Toast.makeText(context, "Add at least 2 points first", Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF8F00)),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                            modifier = Modifier.weight(0.8f)
-                        ) {
-                            Text("Save", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-            }
-
-            // 4. CLIPPED MAP CONTAINER
+            // Full-height map: editing tools float over the map rather than shrinking it.
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
                     .clipToBounds()
             ) {
                 OsmMapContainer(
@@ -1932,137 +1728,92 @@ fun DogWalkScreen() {
                             isPickingHomeOnMap = false
                             saveHomeLocation(tappedGeoPoint)
                             refreshShadeCanopy(tappedGeoPoint)
-                        } else if (isPlanningRoute && pickingRoutePoint != 0 && !isSnappingSegment) {
-                            if (pickingRoutePoint == 1) {
-                                routeStart = tappedGeoPoint
-                                autoLoopMessage = "Start selected. Choose an end point."
-                            } else {
-                                routeEnd = tappedGeoPoint
-                                autoLoopMessage = "End selected. Tap Find walking route."
-                            }
-                            pickingRoutePoint = 0
-                        } else if (isPlanningRoute && !pointToPointMode && !isSnappingSegment) {
-                            if (plannedLegs.isEmpty()) {
-                                plannedLegs = listOf(PlannedLeg(tappedGeoPoint, listOf(tappedGeoPoint)))
-                            } else {
-                                val prev = plannedLegs.last().anchor
-                                if (!snapToStreets) {
-                                    plannedLegs = plannedLegs + PlannedLeg(tappedGeoPoint, listOf(tappedGeoPoint))
-                                } else {
-                                    isSnappingSegment = true
-                                    scope.launch {
-                                        val seg = RouteSnapper.snapFootSegment(prev, tappedGeoPoint)
-                                        val cleanSeg = if (seg.size > 1) seg.drop(1) else seg
-                                        plannedLegs = plannedLegs + PlannedLeg(tappedGeoPoint, cleanSeg)
-                                        isSnappingSegment = false
-                                    }
-                                }
-                            }
+                        } else if (isPlanningRoute && !isSnappingSegment) {
+                            plannedLegs = plannedLegs + PlannedLeg(tappedGeoPoint, listOf(tappedGeoPoint))
+                            autoLoopMessage = null
                         }
                     }
                 )
 
-                // FLOATING TOP MAP CONTROLS (HOME, SHADE, PLANNER, GHOST, STYLE)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.TopCenter)
-                        .padding(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                // Only two map actions stay visible; everything else lives off-map.
+                Row(
+                    modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
                     Button(
-                        onClick = { showHomeDialog = true },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isPickingHomeOnMap) Color(0xFFFF8F00) else Color(0xCC1B5E20)
-                        ),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(
-                            text = if (isPickingHomeOnMap) "Tap Map..." else "🏠 Home",
-                            fontSize = 11.sp,
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    Button(
-                        onClick = {
-                            shadeOverlayEnabled = !shadeOverlayEnabled
-                            if (shadeOverlayEnabled && shadeZones.isEmpty()) {
-                                val anchor = homeLocation ?: walkState.currentLocation
-                                if (anchor != null) refreshShadeCanopy(anchor)
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (shadeOverlayEnabled) Color(0xCC2E7D32) else Color(0xCC1E1E1E)
-                        ),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(
-                            text = if (isLoadingShade) "🌳..." else if (shadeOverlayEnabled) "🌳 Shade: ON" else "🌳 Shade: OFF",
-                            fontSize = 11.sp,
-                            color = Color.White
-                        )
-                    }
-
-                    Button(
-                        onClick = { isPlanningRoute = !isPlanningRoute },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isPlanningRoute) Color(0xFFFF8F00) else Color(0xCC1E1E1E)
-                        ),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(
-                            text = if (isPlanningRoute) "Close Plan" else "Plan Route",
-                            fontSize = 11.sp,
-                            color = if (isPlanningRoute) Color.Black else Color.White,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                    Button(
-                        onClick = { ghostMode = ghostMode.next() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (ghostMode != GhostMode.OFF) Color(0xCC006064) else Color(0xCC1E1E1E)
-                        ),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(ghostMode.label, fontSize = 10.sp, color = Color.White)
-                    }
-
-                    Button(
-                        onClick = {
-                            val nextStyle = mapStyle.next()
-                            mapStyle = nextStyle
-                            prefs.edit().putString("saved_map_style", nextStyle.name).apply()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1E1E1E)),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(mapStyle.label, fontSize = 10.sp, color = Color.White)
-                    }
+                        onClick = { isPlanningRoute = !isPlanningRoute; autoLoopMessage = null },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xEE1A625B))
+                    ) { Text(if (isPlanningRoute) "Close planner" else "Draw route", fontSize = 13.sp) }
+                    OutlinedButton(
+                        onClick = { centerMapTrigger = walkState.currentLocation ?: homeLocation },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xEE18282C))
+                    ) { Text("My location", color = Color.White, fontSize = 13.sp) }
                 }
+
+                // Compact, map-first route editor. No automatic routing service is required.
+                if (isPlanningRoute) {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .padding(start = 10.dp, end = 10.dp, bottom = 105.dp)
+                            .background(Color(0xEE18282C), RoundedCornerShape(20.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text("Draw a route", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text("Tap the map to add stops", color = Color(0xFFB0C5C7), fontSize = 12.sp)
+                            }
+                            Text(
+                                String.format(Locale.US, "%.2f mi", calculatePolylineMeters(plannedFullGeometry) / 1609.344),
+                                color = Color(0xFF83E0CC), fontWeight = FontWeight.Bold, fontSize = 17.sp
+                            )
+                        }
+                        if (autoLoopMessage != null) {
+                            Text(autoLoopMessage!!, color = Color(0xFFFFD18B), fontSize = 12.sp)
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = { plannedLegs = plannedLegs.dropLast(1) },
+                                enabled = plannedLegs.isNotEmpty() && !isSnappingSegment,
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 5.dp)
+                            ) { Text("Undo", fontSize = 12.sp) }
+                            OutlinedButton(
+                                onClick = { plannedLegs = emptyList(); autoLoopMessage = null },
+                                enabled = plannedLegs.isNotEmpty() && !isSnappingSegment,
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 5.dp)
+                            ) { Text("Clear", fontSize = 12.sp) }
+                            Button(
+                                onClick = { if (plannedFullGeometry.size >= 2) showNameDialog = true },
+                                enabled = plannedFullGeometry.size >= 2 && !isSnappingSegment,
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 5.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF27877B))
+                            ) { Text("Save", fontSize = 12.sp) }
+                            TextButton(
+                                onClick = { isPlanningRoute = false; autoLoopMessage = null },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 2.dp)
+                            ) { Text("Done", fontSize = 12.sp) }
+                        }
+                    }
                 }
 
                 // BOTTOM-LEFT LEGEND FOR SHADE & STROLLER SEGMENTS
-                Row(
+                if (!isPlanningRoute) Row(
                     modifier = Modifier
                         .align(Alignment.BottomStart)
-                        .padding(8.dp)
+                        .padding(start = 8.dp, bottom = 106.dp)
                         .background(Color(0xCC121212), RoundedCornerShape(8.dp))
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2080,10 +1831,9 @@ fun DogWalkScreen() {
                         Text("• 🐾 Green / 🛒 Orange", color = Color(0xFFFF9100), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                     }
                 }
-            }
-
-            // 5. BOTTOM WALK CONTROL BAR
-            WalkControlPanel(
+                // Compact controls float over the map instead of consuming map height.
+                Box(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp)) {
+                    WalkControlPanel(
                 walkState = walkState,
                 ghostTargetMiles = if (ghostMode != GhostMode.OFF) {
                     activeGhostRecord?.let { it.distanceMeters / 1609.34 }
@@ -2159,6 +1909,9 @@ fun DogWalkScreen() {
                     }
                 }
             )
+                }
+            }
+
         } else {
             WalkHistoryList(
                 walks = savedWalks,
@@ -2939,93 +2692,62 @@ fun WalkControlPanel(
     onSetReminder: () -> Unit,
     onToggleWalk: () -> Unit
 ) {
-    val totalMiles = walkState.distanceMeters / 1609.34
-    val pawMiles = walkState.pawDistanceMeters / 1609.34
-    val durationFormatted = String.format(
-        Locale.US,
-        "%02d:%02d",
-        walkState.elapsedSeconds / 60,
-        walkState.elapsedSeconds % 60
-    )
-    val paceStr = if (totalMiles >= 0.03) {
-        String.format(Locale.US, "%.1f min/mi", (walkState.elapsedSeconds / 60.0) / totalMiles)
-    } else "-- min/mi"
-
-    val distLabel = when {
-        walkState.usedStrollerInSession || walkState.isStrollerMode ->
-            String.format(Locale.US, "%.2f mi (🐾 %.2f)", totalMiles, pawMiles)
-        ghostTargetMiles != null && ghostTargetMiles > 0.0 ->
-            String.format(Locale.US, "%.2f / %.2f mi", totalMiles, ghostTargetMiles)
-        else ->
-            String.format(Locale.US, "%.2f mi", totalMiles)
-    }
-
+    var toolsExpanded by remember { mutableStateOf(false) }
+    val totalMiles = walkState.distanceMeters / 1609.344
+    val pawMiles = walkState.pawDistanceMeters / 1609.344
+    val duration = String.format(Locale.US, "%02d:%02d", walkState.elapsedSeconds / 60, walkState.elapsedSeconds % 60)
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFF1C2A2E), RoundedCornerShape(18.dp))
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        modifier = Modifier.fillMaxWidth()
+            .background(Color(0xF21A292D), RoundedCornerShape(20.dp))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            StatBlock(
-                label = if (walkState.usedStrollerInSession || walkState.isStrollerMode) "Total (Paw Mi)" else "Distance / Target",
-                value = distLabel
-            )
-            StatBlock("Duration", durationFormatted)
-            StatBlock("Pace", paceStr)
+        if (toolsExpanded) {
+            Text("Walk tools", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onToggleStroller, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 6.dp)
+                ) { Text(if (walkState.isStrollerMode) "Stroller on" else "Stroller off", fontSize = 12.sp, color = Color.White) }
+                OutlinedButton(
+                    onClick = onSetReminder, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 6.dp)
+                ) { Text("Reminder", fontSize = 12.sp, color = Color.White) }
+            }
+            if (walkState.isStrollerMode || walkState.usedStrollerInSession) {
+                Text(String.format(Locale.US, "Paw distance %.2f mi", pawMiles), color = Color(0xFFB8D7D0), fontSize = 12.sp)
+            }
+            if (ghostTargetMiles != null && ghostTargetMiles > 0) {
+                Text(String.format(Locale.US, "Ghost target %.2f mi", ghostTargetMiles), color = Color(0xFFB8D7D0), fontSize = 12.sp)
+            }
         }
-
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Button(
-                onClick = onToggleStroller,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (walkState.isStrollerMode) Color(0xFFFF9100) else Color(0xFF37474F)
-                ),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                modifier = Modifier.weight(1.1f)
-            ) {
-                Text(
-                    text = if (walkState.isStrollerMode) "🛒 Stroller: ON" else "🛒 Stroller: OFF",
-                    fontSize = 11.sp,
-                    color = if (walkState.isStrollerMode) Color.Black else Color.White,
-                    fontWeight = FontWeight.Bold
-                )
+            Column(modifier = Modifier.weight(1f)) {
+                Text("DISTANCE", color = Color(0xFFAAC2C3), fontSize = 10.sp)
+                Text(String.format(Locale.US, "%.2f mi", totalMiles), color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
             }
-
+            Column(modifier = Modifier.weight(0.8f)) {
+                Text("TIME", color = Color(0xFFAAC2C3), fontSize = 10.sp)
+                Text(duration, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            }
             OutlinedButton(
-                onClick = onSetReminder,
-                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
-                modifier = Modifier.weight(0.8f)
-            ) {
-                Text("⏰ Remind", fontSize = 11.sp, color = Color.White)
-            }
-
+                onClick = { toolsExpanded = !toolsExpanded },
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 5.dp)
+            ) { Text(if (toolsExpanded) "Less" else "Tools", color = Color.White, fontSize = 12.sp) }
             Button(
                 onClick = onToggleWalk,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (walkState.isTracking) Color(0xFFB83F44) else Color(0xFF277D73)
-                ),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                modifier = Modifier.weight(1.3f)
-            ) {
-                Text(
-                    text = if (walkState.isTracking) "Finish walk" else "Start walk",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp
-                )
-            }
+                colors = ButtonDefaults.buttonColors(containerColor = if (walkState.isTracking) Color(0xFFAE4549) else Color(0xFF27877B)),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+            ) { Text(if (walkState.isTracking) "Finish" else "Start walk", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
         }
     }
 }
 
+@Composable
 @Composable
 fun StatBlock(label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
