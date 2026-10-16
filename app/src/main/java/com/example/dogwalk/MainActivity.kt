@@ -530,63 +530,79 @@ object ShadeRepository {
 data class PlannedLeg(val anchor: GeoPoint, val snappedPoints: List<GeoPoint>)
 
 object RouteSnapper {
-    suspend fun snapFootSegment(start: GeoPoint, end: GeoPoint): List<GeoPoint> =
-        withContext(Dispatchers.IO) {
-            val coords = "${start.longitude},${start.latitude};${end.longitude},${end.latitude}"
-            val endpoints = listOf(
-                "https://routing.openstreetmap.de/routed-foot/route/v1/foot/$coords?overview=full&geometries=geojson",
-                "https://router.project-osrm.org/route/v1/foot/$coords?overview=full&geometries=geojson"
-            )
-            for (url in endpoints) {
-                try {
-                    val conn = URL(url).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 6000
-                    conn.readTimeout = 6000
-                    conn.requestMethod = "GET"
-                    conn.setRequestProperty("User-Agent", "PersonalDogWalkTracker/6.0 (Android)")
-                    if (conn.responseCode == 200) {
-                        val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-                        val routes = json.optJSONArray("routes")
-                        if (routes != null && routes.length() > 0) {
-                            val coordArray = routes.getJSONObject(0)
-                                .getJSONObject("geometry")
-                                .getJSONArray("coordinates")
-                            val points = ArrayList<GeoPoint>(coordArray.length())
-                            for (i in 0 until coordArray.length()) {
-                                val pair = coordArray.getJSONArray(i)
-                                points.add(GeoPoint(pair.getDouble(1), pair.getDouble(0)))
-                            }
-                            if (points.isNotEmpty()) return@withContext points
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
-            listOf(start, end)
-        }
+    private const val WALKING_ROUTER = "https://routing.openstreetmap.de/routed-foot/route/v1/driving/"
+    // The routed-foot instance is pedestrian-configured; the URL profile is an OSRM API label.
+    // Never fall back to router.project-osrm.org: its public instance is car-oriented.
 
-    // Self-calibrating loop generator: builds a 3-leg triangle loop and rescales if street detours exceed targetMiles
+    suspend fun snapFootSegment(
+        start: GeoPoint,
+        end: GeoPoint,
+        allowDirectFallback: Boolean = true
+    ): List<GeoPoint> = withContext(Dispatchers.IO) {
+        val coords = "${start.longitude},${start.latitude};${end.longitude},${end.latitude}"
+        try {
+            val url = WALKING_ROUTER + coords + "?overview=full&geometries=geojson"
+            val conn = URL(url).openConnection() as HttpURLConnection
+            try {
+                conn.connectTimeout = 6000
+                conn.readTimeout = 6000
+                conn.requestMethod = "GET"
+                conn.setRequestProperty("User-Agent", "PersonalDogWalkTracker/6.0 (Android)")
+                if (conn.responseCode == 200) {
+                    val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                    val routes = json.optJSONArray("routes")
+                    if (routes != null && routes.length() > 0) {
+                        val coordinates = routes.getJSONObject(0).getJSONObject("geometry")
+                            .getJSONArray("coordinates")
+                        val points = (0 until coordinates.length()).map { index ->
+                            val pair = coordinates.getJSONArray(index)
+                            GeoPoint(pair.getDouble(1), pair.getDouble(0))
+                        }
+                        if (points.size >= 2) return@withContext points
+                    }
+                }
+            } finally {
+                conn.disconnect()
+            }
+        } catch (_: Exception) {
+            // Let auto-loop reject unroutable legs; manual direct-line mode is explicitly allowed.
+        }
+        if (allowDirectFallback) listOf(start, end) else emptyList()
+    }
+
+    /** Returns a verified pedestrian loop or throws; never silently accepts an oversized route. */
     suspend fun generateCalibratedLoop(
         origin: GeoPoint,
         targetMiles: Double,
         bearingDeg: Double
     ): List<PlannedLeg> {
-        val targetMeters = (targetMiles * 1609.34).coerceAtLeast(300.0)
-        // Street grids typically add a ~1.55x detour over straight-line triangle sides
-        var radiusMeters = targetMeters / (3.0 * 1.55)
-
-        var legs = buildTriangleLoop(origin, radiusMeters, bearingDeg)
-        val firstPassMeters = calculatePolylineMeters(legs.flatMap { it.snappedPoints })
-
-        // If OSRM street detours made the walk >18% off target, rescale radius proportionally and re-snap
-        if (firstPassMeters > 50.0) {
-            val ratio = targetMeters / firstPassMeters
-            if (ratio < 0.82 || ratio > 1.20) {
-                radiusMeters = (radiusMeters * ratio).coerceIn(70.0, 2200.0)
-                legs = buildTriangleLoop(origin, radiusMeters, bearingDeg)
+        require(targetMiles in 0.25..2.50) { "Select a distance between 0.25 and 2.50 miles." }
+        val targetMeters = targetMiles * 1609.344
+        val tolerance = 0.15
+        // Start with a conservative triangle, then calibrate against actual routed length.
+        var radiusMeters = (targetMeters / 4.0).coerceIn(55.0, 1100.0)
+        var bestError = Double.POSITIVE_INFINITY
+        var bestMiles = 0.0
+        repeat(4) {
+            val legs = buildTriangleLoop(origin, radiusMeters, bearingDeg)
+            if (legs.isNotEmpty()) {
+                val meters = calculatePolylineMeters(legs.flatMap { it.snappedPoints })
+                val error = kotlin.math.abs(meters - targetMeters) / targetMeters
+                if (error < bestError) {
+                    bestError = error
+                    bestMiles = meters / 1609.344
+                }
+                if (error <= tolerance) return legs
+                // Dampen corrections: street-network geometry is discontinuous near junctions.
+                val adjustment = (targetMeters / meters).coerceIn(0.55, 1.6)
+                radiusMeters = (radiusMeters * adjustment).coerceIn(35.0, 1500.0)
+            } else {
+                radiusMeters = (radiusMeters * 0.72).coerceAtLeast(35.0)
             }
         }
-        return legs
+        val detail = if (bestError.isFinite())
+            "Closest walk was ${String.format(Locale.US, "%.2f", bestMiles)} mi. " else ""
+        throw IllegalStateException(detail + "No walking loop within 15% of your target. Try another direction or distance.")
     }
 
     private suspend fun buildTriangleLoop(
@@ -596,27 +612,27 @@ object RouteSnapper {
     ): List<PlannedLeg> {
         val metersPerDegLat = 111320.0
         val metersPerDegLon = (111320.0 * cos(Math.toRadians(origin.latitude))).coerceAtLeast(10000.0)
-
-        val rad1 = Math.toRadians(bearingDeg - 28.0)
-        val rad2 = Math.toRadians(bearingDeg + 28.0)
-
+        // A wider triangle avoids nearly overlapping out-and-back legs.
+        val rad1 = Math.toRadians(bearingDeg - 60.0)
+        val rad2 = Math.toRadians(bearingDeg + 60.0)
         val p1 = GeoPoint(
-            origin.latitude + (radiusMeters * cos(rad1) / metersPerDegLat),
-            origin.longitude + (radiusMeters * sin(rad1) / metersPerDegLon)
+            origin.latitude + radiusMeters * cos(rad1) / metersPerDegLat,
+            origin.longitude + radiusMeters * sin(rad1) / metersPerDegLon
         )
         val p2 = GeoPoint(
-            origin.latitude + (radiusMeters * cos(rad2) / metersPerDegLat),
-            origin.longitude + (radiusMeters * sin(rad2) / metersPerDegLon)
+            origin.latitude + radiusMeters * cos(rad2) / metersPerDegLat,
+            origin.longitude + radiusMeters * sin(rad2) / metersPerDegLon
         )
-
-        val leg1 = snapFootSegment(origin, p1)
-        val leg2 = snapFootSegment(p1, p2)
-        val leg3 = snapFootSegment(p2, origin)
-
+        val leg1 = snapFootSegment(origin, p1, allowDirectFallback = false)
+        if (leg1.size < 2) return emptyList()
+        val leg2 = snapFootSegment(p1, p2, allowDirectFallback = false)
+        if (leg2.size < 2) return emptyList()
+        val leg3 = snapFootSegment(p2, origin, allowDirectFallback = false)
+        if (leg3.size < 2) return emptyList()
         return listOf(
             PlannedLeg(origin, leg1),
-            PlannedLeg(p1, if (leg2.size > 1) leg2.drop(1) else leg2),
-            PlannedLeg(p2, if (leg3.size > 1) leg3.drop(1) else leg3)
+            PlannedLeg(p1, leg2.drop(1)),
+            PlannedLeg(p2, leg3.drop(1))
         )
     }
 }
@@ -1237,6 +1253,7 @@ fun DogWalkScreen() {
     var isSnappingSegment by remember { mutableStateOf(false) }
     var plannedLegs by remember { mutableStateOf<List<PlannedLeg>>(emptyList()) }
     var yorkieDirectionIndex by remember { mutableIntStateOf(0) }
+    var autoLoopMessage by remember { mutableStateOf<String?>(null) }
 
     // Dialog States
     var showSafetyInfoDialog by remember { mutableStateOf(false) }
@@ -1681,69 +1698,69 @@ fun DogWalkScreen() {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color(0xFF2D1E18), RoundedCornerShape(10.dp))
-                        .padding(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                        .background(Color(0xFF222A30), RoundedCornerShape(16.dp))
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Row A: Live Planned Mileage + Target Distance Selector (- / +)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text("Plan a walking loop", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(
+                                if (homeLocation != null) "Starting from Home" else "Starting from current GPS location",
+                                color = Color(0xFFB0BEC5), fontSize = 12.sp
+                            )
+                        }
+                        Text(
+                            if (isSnappingSegment) "Finding route…" else "Walking route",
+                            color = Color(0xFF80CBC4), fontSize = 12.sp
+                        )
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column {
-                            Text(
-                                text = if (isSnappingSegment) {
-                                    "Calibrating ${String.format(Locale.US, "%.2f", targetAutoMiles)} mi loop..."
-                                } else {
-                                    String.format(Locale.US, "Planned: %.2f mi (%d stops)", plannedMiles, plannedLegs.size)
-                                },
-                                color = Color(0xFFFFD600),
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 13.sp
-                            )
-                            Text(
-                                text = if (homeLocation != null) "Starts at 🏠 Home • Shade-Aware" else "Starts at GPS • Shade-Aware",
-                                color = Color.LightGray,
-                                fontSize = 10.sp
-                            )
+                            Text("TARGET DISTANCE", color = Color(0xFFB0BEC5), fontSize = 10.sp)
+                            Text(String.format(Locale.US, "%.2f mi", targetAutoMiles),
+                                color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
                         }
-
-                        // Target Auto-Loop Distance Stepper
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            modifier = Modifier
-                                .background(Color(0xFF1E1E1E), RoundedCornerShape(8.dp))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            TextButton(
+                            OutlinedButton(
+                                enabled = !isSnappingSegment && targetAutoMiles > 0.25,
                                 onClick = {
-                                    targetAutoMiles = max(0.25, ((targetAutoMiles - 0.25) * 4.0).roundToInt() / 4.0)
+                                    targetAutoMiles = (targetAutoMiles - 0.25).coerceAtLeast(0.25)
                                     prefs.edit().putFloat("target_auto_miles", targetAutoMiles.toFloat()).apply()
+                                    autoLoopMessage = null
                                 },
-                                contentPadding = PaddingValues(0.dp),
-                                modifier = Modifier.width(28.dp).height(26.dp)
-                            ) {
-                                Text("−", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                            }
-                            Text(
-                                text = String.format(Locale.US, "%.2f mi", targetAutoMiles),
-                                color = Color(0xFF00E676),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                            TextButton(
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                            ) { Text("−", color = Color.White, fontSize = 18.sp) }
+                            OutlinedButton(
+                                enabled = !isSnappingSegment && targetAutoMiles < 2.50,
                                 onClick = {
-                                    targetAutoMiles = min(2.50, ((targetAutoMiles + 0.25) * 4.0).roundToInt() / 4.0)
+                                    targetAutoMiles = (targetAutoMiles + 0.25).coerceAtMost(2.50)
                                     prefs.edit().putFloat("target_auto_miles", targetAutoMiles.toFloat()).apply()
+                                    autoLoopMessage = null
                                 },
-                                contentPadding = PaddingValues(0.dp),
-                                modifier = Modifier.width(28.dp).height(26.dp)
-                            ) {
-                                Text("+", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                            }
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                            ) { Text("+", color = Color.White, fontSize = 18.sp) }
                         }
+                    }
+                    Text(
+                        if (isSnappingSegment) "Checking pedestrian streets and matching your distance…"
+                        else if (plannedFullGeometry.size > 1) String.format(Locale.US, "Current route: %.2f mi • %d stops", plannedMiles, plannedLegs.size)
+                        else "Choose a distance, then generate a loop.",
+                        color = Color(0xFFCFD8DC), fontSize = 12.sp
+                    )
+                    if (autoLoopMessage != null) {
+                        Text(autoLoopMessage!!, color = Color(0xFFFFCC80), fontSize = 12.sp)
                     }
 
                     // Row B: Action Buttons
@@ -1761,19 +1778,23 @@ fun DogWalkScreen() {
                                     yorkieDirectionIndex = (yorkieDirectionIndex + 1) % 8
                                     val bearing = ShadeRepository.pickShadiestBearingDeg(startPt, shadeZones, dirIdx)
                                     isSnappingSegment = true
+                                    autoLoopMessage = null
                                     scope.launch {
-                                        plannedLegs = RouteSnapper.generateCalibratedLoop(
-                                            origin = startPt,
-                                            targetMiles = targetAutoMiles,
-                                            bearingDeg = bearing
-                                        )
-                                        isSnappingSegment = false
-                                        val actualMi = calculatePolylineMeters(plannedLegs.flatMap { it.snappedPoints }) / 1609.34
-                                        Toast.makeText(
-                                            context,
-                                            String.format(Locale.US, "Generated %.2f mi shade-biased loop!", actualMi),
-                                            Toast.LENGTH_SHORT
-                                        ).show()
+                                        try {
+                                            val generated = RouteSnapper.generateCalibratedLoop(
+                                                origin = startPt,
+                                                targetMiles = targetAutoMiles,
+                                                bearingDeg = bearing
+                                            )
+                                            plannedLegs = generated
+                                            val actualMi = calculatePolylineMeters(generated.flatMap { it.snappedPoints }) / 1609.344
+                                            autoLoopMessage = String.format(Locale.US, "Ready: %.2f mi pedestrian loop", actualMi)
+                                        } catch (e: Exception) {
+                                            autoLoopMessage = e.message ?: "Unable to generate a walking loop. Please try again."
+                                            Toast.makeText(context, autoLoopMessage, Toast.LENGTH_LONG).show()
+                                        } finally {
+                                            isSnappingSegment = false
+                                        }
                                     }
                                 }
                             },
@@ -1781,7 +1802,7 @@ fun DogWalkScreen() {
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                             modifier = Modifier.weight(1.3f)
                         ) {
-                            Text("Auto-Loop 🐾", fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(if (isSnappingSegment) "Finding…" else "Generate loop", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold)
                         }
 
                         OutlinedButton(
