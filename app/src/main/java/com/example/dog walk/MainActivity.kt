@@ -2748,7 +2748,6 @@ fun WalkControlPanel(
 }
 
 @Composable
-@Composable
 fun StatBlock(label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(text = label, color = Color(0xFFACC1C3), fontSize = 11.sp)
